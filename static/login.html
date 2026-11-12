@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title>
+<link rel="icon" href="/favicon.svg?v=1.43.2">
+<link rel="stylesheet" href="/brand.css?v=1.31">
+<style>
+  /* F3: a brand panel beside the form; they stack on a phone. */
+  body { min-height: 100dvh; display: flex; flex-wrap: wrap; }
+  .panel { flex: 1 1 420px; background: #0F2A1C; padding: 56px; display: flex; flex-direction: column; gap: 24px; box-sizing: border-box; }
+  .panel .mark { display: flex; align-items: center; gap: 12px; font: 700 26px/1 var(--display); color: #fff; }
+  .panel h1 { font-size: clamp(36px, 5vw, 56px); line-height: 1.02; color: #fff; max-width: 12em; }
+  .panel p { margin: 0; font-size: 18px; color: var(--muted); max-width: 28em; }
+  .side { flex: 1 1 420px; display: flex; align-items: center; justify-content: center; padding: 48px 24px; box-sizing: border-box; }
+  .sign { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 18px; }
+  .sign h2 { font-size: 34px; }
+  form { display: flex; flex-direction: column; gap: 14px; }
+  .field input { min-height: 46px; }
+  .alt { display: flex; flex-direction: column; gap: 10px; }
+  .or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+  .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .btn { justify-content: center; min-height: 48px; }
+  #msg { margin: 0; font-size: 14px; }
+  @media (max-width: 640px) { .panel { padding: 32px 24px; } }
+</style>
+</head>
+<body>
+<section class="panel">
+  <div class="mark"><svg width="40" height="40" viewBox="0 0 64 64" aria-hidden="true"><path d="M32 32L12 12M32 32L52 12M32 32L12 52M32 32L52 52" stroke="#2C4A3B" stroke-width="4" stroke-linecap="round"/><circle cx="12" cy="12" r="6" fill="#6EE7A8"/><circle cx="52" cy="12" r="6" fill="#6EE7A8"/><circle cx="12" cy="52" r="6" fill="#6EE7A8"/><circle cx="52" cy="52" r="6" fill="#6EE7A8"/><circle cx="32" cy="32" r="12" fill="#fff"/></svg>emHUB</div>
+  <h1>Restricted access.</h1>
+  <p>For authorised accounts only.</p>
+</section>
+<div class="side">
+<main class="sign">
+  <h2>Sign in</h2>
+  <form method="post" action="/auth/login">
+    <label class="field">Username
+      <input name="username" autocomplete="username" required autofocus>
+    </label>
+    <label class="field">Password
+      <input name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <p id="msg" class="error-text" role="alert" hidden></p>
+    <button class="btn" type="submit">Sign in</button>
+  </form>
+  <div class="alt" id="oidc" hidden>
+    <div class="or">or</div>
+    <a class="btn quiet" href="/auth/oidc/start?mode=login" id="oidc-btn">Single sign-on</a>
+  </div>
+</main>
+</div>
+<script>
+  const messages = {
+    invalid: "Wrong username or password.",
+    rate: "Too many attempts. Try again later.",
+    not_linked: "This account can't sign in here.",
+    oidc_failed: "Sign-in didn't complete. Try again.",
+    oidc_state: "The sign-in expired. Start again.",
+    oidc_off: "This sign-in option isn't available.",
+    oidc_only: "Use the other sign-in option for this account.",
+  };
+  const error = new URLSearchParams(location.search).get("error");
+  if (messages[error]) { msg.textContent = messages[error]; msg.hidden = false; }
+  fetch("/auth/config").then(r => r.json()).then(c => {
+    if (c.oidc) { oidc.hidden = false; document.getElementById("oidc-btn").textContent = "Sign in with " + c.oidcLabel; }
+  });
+</script>
+</body>
+</html>

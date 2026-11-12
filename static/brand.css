@@ -1,0 +1,72 @@
+@import url("https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@500;600;700&display=swap");
+
+:root {
+  /* emHUB 2.15: dark only, the forest palette (F3 design). Mint takes amber's old jobs: plates, counts, focus. */
+  --sign: #4CC67A;        /* Plan&Ride green, lifted for the dark ground */
+  --sign-ink: #0C1A14;
+  --amber: #6EE7A8;       /* mint: bug-id plates, counts, highlights */
+  --ink: #E6EFE9;
+  --slate: #9DB3A6;
+  --paper: #0C1A14;
+  --surface: #13241C;
+  --line: #1E3329;
+  --muted: #9DB3A6;
+  --ok: #4CC67A;
+  --late: #FFA866;
+  --bad: #FF6B61;
+  --focus: #6EE7A8;
+  --rail: #08130E;
+  --rail-text: #9DB3A6;
+  --shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
+  --display: "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+  --body: "Barlow", "Segoe UI", system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--body); }
+h1, h2, h3 { font-family: var(--display); font-weight: 700; line-height: 1.15; margin: 0; }
+a { color: var(--sign); }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+[hidden] { display: none !important; }
+
+/* The route plate: bug ids and line numbers, like the plate on a departure board. */
+.plate {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--display); font-weight: 700; font-size: 15px; letter-spacing: 0.3px;
+  min-width: 3.2em; padding: 3px 8px; border-radius: 6px;
+  background: var(--amber); color: #0B3D1C; white-space: nowrap;
+}
+.plate.line { background: var(--sign); color: var(--sign-ink); }
+.plate.big { font-size: 22px; padding: 5px 12px; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 999px; padding: 9px 18px;
+  background: var(--sign); color: var(--sign-ink); font-weight: 600;
+}
+.btn:hover { filter: brightness(1.08); }
+.btn:disabled { opacity: 0.55; cursor: default; filter: none; }
+.btn.quiet { background: transparent; color: var(--ink); border-color: var(--line); }
+.btn.danger { background: transparent; color: var(--bad); border-color: var(--line); }
+
+.field { display: flex; flex-direction: column; gap: 6px; font-size: 14px; color: var(--muted); }
+.field input, .field select, .field textarea, .input {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  padding: 9px 11px; color: var(--ink); font-size: 15px;
+}
+textarea { resize: vertical; }
+/* Bare fields (a status picker in a sentence, map selects): themed too, never the browser's light box. */
+:where(select, textarea, input:not([type=checkbox], [type=radio], [type=range], [type=file], [type=color])) {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; color: var(--ink);
+}
+:where(select) { cursor: pointer; }
+select option { background: var(--surface); color: var(--ink); }
+input[type=checkbox], input[type=radio], progress { accent-color: var(--sign); }
+
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.error-text { color: var(--bad); }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
