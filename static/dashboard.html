@@ -498,7 +498,7 @@ async function route() {
   const isTab = tab in me.access;
   $("#view-only").hidden = !isTab || !can(tab, "r") || can(tab, "w");
   document.querySelectorAll("[data-nav]").forEach((a) =>
-    a.setAttribute("aria-current", (a.dataset.nav === ({ bug: "bugs", idea: "ideas", templates: "settings", replies: "settings", activity: "settings" }[page] || page || "bugs")) ? "page" : "false"));
+    a.setAttribute("aria-current", (a.dataset.nav === ({ bug: "bugs", idea: "ideas", templates: "settings", replies: "settings", activity: "settings", fares: "settings" }[page] || page || "bugs")) ? "page" : "false"));
   try {
     if (isTab ? !can(tab, "r") : page !== "settings" && me.role !== "admin") {
       view.innerHTML = `<div class="empty"><h2>${can(tab, "w") ? "This page needs read access" : "No access to this page"}</h2>
@@ -513,6 +513,7 @@ async function route() {
     if (page === "notices") return await renderNotices(arg);
     if (page === "replies") return await renderReplies(arg);
     if (page === "activity") return await renderActivity();
+    if (page === "fares") return await renderFares();
     if (page === "server") return await renderServer();
     if (page === "timetable") return await renderTimetable();
     if (page === "map") return renderMap(arg ? decodeURIComponent(arg) : null);
@@ -524,6 +525,12 @@ async function route() {
     return await renderBugs(page === "bug" ? Number(arg) : null, "bug");
   } catch (e) {
     if (e.message !== "signed out") view.innerHTML = `<div class="empty"><h2>Couldn't load this page</h2><p>${esc(e.message)}</p></div>`;
+  } finally {
+    // 1.54.0: a price list about to end (or ended) is said on top of every page until an admin types in the new one.
+    if (me.role === "admin" && page !== "fares" && page !== "map") {
+      route.fares ??= await api("fares").then((t) => t.due, () => []);
+      if (route.fares.length && !view.querySelector(".fare-reminder")) view.insertAdjacentHTML("afterbegin", `<div class="fare-reminder section">${fareReminder(route.fares)}</div>`);
+    }
   }
 }
 addEventListener("hashchange", route);
@@ -938,6 +945,83 @@ async function renderReleases(open) {
 }
 
 // ------------------------------------------------------------------ saved replies (Slovak and English)
+
+// 1.54.0: what a ride costs. The carriers' price lists, typed here; the apps read them (GET /api/v1/fares).
+const FARE_NAMES = { full: "Full fare", child: "Child 6 to 18", student: "Pupil or student to 26", senior: "Senior 63 to 70", ztp: "ŤZP card holder",
+  donor: "Blood donor (Janský plaque)", companion: "Companion of a ŤZP-S holder" };
+const euro = (cents) => cents == null ? "" : (cents / 100).toFixed(2).replace(".", ",");
+const cents = (text) => {
+  const t = String(text).trim().replace(",", ".");
+  if (!t) return null;
+  if (!/^\d{1,4}(\.\d{1,2})?$/.test(t)) throw new Error(`"${text}" is not a price: write it like 0,27`);
+  return Math.round(Number(t) * 100);
+};
+const fareReminder = (due) => (due || []).map((d) => `<p class="error-text" role="alert">The ${esc(d.name)} price list ${d.validTo < new Date().toISOString().slice(0, 10) ? "ended" : "ends"} on ${esc(d.validTo)}.
+  Type in the new prices and dates in <a href="#fares">Fares</a> when the carrier publishes them; until then the apps show the old prices.</p>`).join("");
+async function renderFares() {
+  const table = await api("fares");
+  const price = (path, pair) => [0, 1].map((i) => `<td><input class="input fare" data-path="${path}.${i}" inputmode="decimal" size="6" value="${euro(pair[i])}" aria-label="${i ? "cash" : "card"}"></td>`).join("");
+  view.innerHTML = `
+    <div class="page-head"><h1>Fares</h1><a class="btn quiet" href="#settings">Back to Settings</a></div>
+    <div class="section">
+      <p class="muted" style="max-width:76ch;margin:0 0 16px">What one ride costs, from the carriers' own price lists, in euros. The apps add up a journey
+        from these and warn a rider whose credit won't cover it. A line goes by the first tariff whose operator names are part of
+        its operator's name (Timetable shows each line's operator). Leave a price empty where there is no such ticket.</p>
+      ${fareReminder(table.due)}
+      <form id="fares-form">
+      ${table.tariffs.map((t, n) => `<section class="line-card" style="margin-bottom:16px">
+        <div class="grid2">
+          <label class="field">Name<input class="input" data-path="${n}.name" maxlength="60" required value="${esc(t.name)}"></label>
+          <label class="field">Valid from<input class="input" type="date" data-path="${n}.validFrom" value="${esc(t.validFrom)}"></label>
+          <label class="field">Valid to (empty = no end; a week before it emHUB reminds you)<input class="input" type="date" data-path="${n}.validTo" value="${esc(t.validTo)}"></label>
+        </div>
+        <label class="field">Operators, one per line<textarea class="input" data-path="${n}.operators" rows="2">${esc(t.operators.join("\n"))}</textarea></label>
+        ${t.kind === "flat" ? `
+        <div class="grid2">
+          <label class="field">A ticket paid by card lasts (minutes, 0 = one ride)<input class="input" data-path="${n}.transferMinutes" inputmode="numeric" pattern="[0-9]+" value="${t.transferMinutes}"></label>
+          <label class="field">A change within that time costs (€)<input class="input fare" data-path="${n}.transferCents" inputmode="decimal" value="${euro(t.transferCents)}"></label>
+        </div>
+        <table class="table"><thead><tr><th>One ride</th><th>Card or app</th><th>Cash</th></tr></thead><tbody>
+          ${table.categories.filter((c) => t.prices[c]).map((c) => `<tr><td>${FARE_NAMES[c]}</td>${price(`${n}.prices.${c}`, t.prices[c])}</tr>`).join("")}
+        </tbody></table>` : `
+        <p class="muted small">By tariff units between the zones. Children, students, seniors and donors pay the discounted column; ŤZP pays the special price whatever the distance.</p>
+        <table class="table"><thead><tr><th>Units up to</th><th>Minutes</th><th>Full, card</th><th>Full, cash</th><th>Discounted, card</th><th>Discounted, cash</th></tr></thead><tbody>
+          ${t.bands.map((b, i) => `<tr><td>${b.upTo}</td><td>${b.minutes}</td>${price(`${n}.bands.${i}.full`, b.full)}${price(`${n}.bands.${i}.discount`, b.discount)}</tr>`).join("")}
+          <tr><td colspan="2">Special (ŤZP), any distance</td>${price(`${n}.special`, t.special)}<td colspan="2"></td></tr>
+        </tbody></table>`}
+      </section>`).join("")}
+      <p class="error-text" id="fares-error" hidden></p>
+      <div class="row" style="gap:8px"><button class="btn" type="submit">Save fares</button>
+        <button class="btn quiet" type="button" id="fares-reset">Back to the built-in price lists</button></div>
+      </form>
+    </div>`;
+  const form = $("#fares-form");
+  const error = $("#fares-error");
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    error.hidden = true;
+    try {
+      const next = { tariffs: JSON.parse(JSON.stringify(table.tariffs)) };
+      form.querySelectorAll("[data-path]").forEach((input) => {
+        const path = input.dataset.path.split(".");
+        const key = path.pop();
+        const at = path.reduce((o, k) => o[k], next.tariffs);
+        at[key] = input.classList.contains("fare") ? (key === "transferCents" ? cents(input.value) ?? 0 : cents(input.value))
+          : key === "operators" ? input.value.split("\n").map((x) => x.trim()).filter(Boolean)
+          : key === "transferMinutes" ? Number(input.value) || 0 : input.value.trim();
+      });
+      await api("fares", next);
+      route.fares = null;
+      toast("Fares saved");
+      renderFares();
+    } catch (err) { error.textContent = err.message; error.hidden = false; }
+  };
+  $("#fares-reset").onclick = async () => {
+    if (!confirm("Replace every price here with the built-in price lists?")) return;
+    try { await api("fares", { reset: true }); toast("Fares are the built-in price lists again"); renderFares(); }
+    catch (err) { error.textContent = err.message; error.hidden = false; }
+  };
+}
 
 async function renderReplies(openId) {
   const { replies } = await api("replies");
@@ -2856,7 +2940,8 @@ async function renderSettings(flag) {
           <div class="row"><button class="btn" type="submit">Save email settings</button><button class="btn quiet" id="test-mail" type="button">Send test email to me</button>
             <a class="btn quiet" href="#templates">Edit email templates</a>
             <a class="btn quiet" href="#replies">Saved replies</a>
-            <a class="btn quiet" href="#activity">Activity log</a></div>
+            <a class="btn quiet" href="#activity">Activity log</a>
+            <a class="btn quiet" href="#fares">Fares</a></div>
         </form>
       </section>`}
 

@@ -82,6 +82,7 @@ R = [
     ("GET", "settings", None), ("POST", "settings", None), ("POST", "settings/test-oidc", None), ("GET", "templates", None), ("GET", "templates/invite", None),
     ("POST", "templates/invite/save", None), ("POST", "templates/invite/reset", None), ("POST", "templates/invite/preview", None), ("POST", "mail/test", None),
     ("POST", "replies", None), ("POST", "replies/1", None), ("POST", "replies/1/delete", None),
+    ("GET", "fares", None), ("POST", "fares", None),
 ]
 SHARED = [("GET", "labels", ("bugs", "ideas")), ("GET", "replies", ("bugs", "ideas")), ("GET", "releases", ("releases", "bugs", "ideas")),
           ("GET", "timetable/stops?q=a", ("timetable", "lines", "map")), ("GET", "fleet?map=1", ("fleet", "map"))]

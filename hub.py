@@ -52,11 +52,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import fares
 import fleet
 import sadzv
 import timetable
 
-VERSION = "1.53.0"
+VERSION = "1.54.0"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -1331,6 +1332,47 @@ def save_settings(conn, values):
     with _settings_lock:
         _settings.clear()
     _discovery.clear()  # the issuer may have changed
+
+
+def fare_table():
+    """1.54.0: what a ride costs (fares.py), as saved in the dashboard or the price lists it starts from."""
+    setting("admin_email")  # fills the cache of saved values
+    with _settings_lock:
+        saved = _settings.get("fares")
+    return fares.load(saved)
+
+
+_fare_zones = {}
+
+
+def fare_zones():
+    """IDS BBSK's zones and the tariff units between them (ids_bbsk_zones.json), read once."""
+    if not _fare_zones:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ids_bbsk_zones.json"), encoding="utf-8") as f:
+            _fare_zones.update(json.load(f))
+    return _fare_zones
+
+
+def fares_due():
+    """Price lists that end within a week or have ended: the dashboard reminds the admins to type in the new one."""
+    return [{"name": name, "validTo": day} for name, day in fares.due(fare_table(), datetime.now(ZoneInfo("Europe/Bratislava")).date())]
+
+
+def add_tariffs(journeys):
+    """Each bus of a journey says which tariff it goes by (GET fares has the prices), where one is known."""
+    table = fare_table()
+    kinds = {t["id"]: t["kind"] for t in table["tariffs"]}
+    for j in journeys:
+        for leg in j["legs"]:
+            tariff = fares.tariff_of(table, leg.get("operator")) if leg.get("type") == "trip" else None
+            if not tariff:
+                continue
+            leg["tariff"] = tariff
+            if kinds[tariff] == "units":
+                # IDS BBSK: the price goes by the tariff units between the zones of the two stops.
+                n = fares.units(fare_zones(), leg["from"]["name"], leg["to"]["name"])
+                if n is not None:
+                    leg["units"] = n
 
 
 def smtp_label():
@@ -2834,6 +2876,7 @@ def timetable_query(route, query):
             journeys = [j for j in journeys if j["arrival"] <= arrive_by * 1000][-count:]
         journeys = journeys[:count]
         add_transfer_odds(t, journeys)
+        add_tariffs(journeys)
         return 200, {"from": t.station_json(origin), "to": t.station_json(target), "connections": journeys}
     return 404, {"error": "Not found"}
 
@@ -3294,6 +3337,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and route == "notices":
             with db() as conn:
                 return self.send(200, {"notices": active_notices(conn)}, headers=self.cors())
+        if method == "GET" and route == "fares":
+            return self.send(200, fare_table(), headers=self.cors())
         if method == "POST" and route == "submissions":
             return self.submit_submission()
         if route.startswith("eta"):
@@ -3818,6 +3863,18 @@ class Handler(BaseHTTPRequestHandler):
             days = min(max(int(query.get("days") or 30), 1), 365) if str(query.get("days") or "30").isdigit() else 30
             with db() as conn:
                 return self.send(200, rider_stats(conn, days))
+        if method == "GET" and route == "fares":
+            return self.send(200, dict(fare_table(), categories=fares.CATEGORIES, due=fares_due()))
+        if method == "POST" and route == "fares":
+            data = self.json_body(limit=200_000)
+            try:
+                table = fares.DEFAULT if data.get("reset") else fares.clean(data)
+            except (ValueError, KeyError, TypeError) as e:
+                return self.error(400, str(e) or "Check the fares")
+            with db() as conn:
+                save_settings(conn, {"fares": json.dumps(table, ensure_ascii=False)})
+            audit(user["username"], "fares " + ("reset to the price lists" if data.get("reset") else "changed"))
+            return self.send(200, dict(table, categories=fares.CATEGORIES))
         if method == "GET" and route == "replies":
             with db() as conn:
                 return self.send(200, {"replies": [dict(x) for x in conn.execute("SELECT * FROM saved_replies ORDER BY title")]})
