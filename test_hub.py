@@ -449,7 +449,7 @@ assert ws_open.__name__ and call("/api/v1/shares/live?side=owner&id=x&token=y")[
 owner.close(); other.close()
 assert call("/admin/api/site")[0] == 401, "editing needs a signed-in admin"
 pages = json.loads(call("/admin/api/site", cookie=cookie)[2])
-assert len(pages) == 8 and not any(p["custom"] for p in pages)
+assert len(pages) == 10 and not any(p["custom"] for p in pages)
 assert b"Draft" in json.loads(call("/admin/api/site/support/en/preview", {"html": "<h1>Draft</h1>"}, cookie)[2])["html"].encode()
 assert b"Draft" not in call("/en/support")[2], "a preview is not published"
 assert call("/admin/api/site/support/en/save", {"html": "<h1>New support</h1>"}, cookie)[0] == 200

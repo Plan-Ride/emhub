@@ -11,6 +11,7 @@ Sources (read 2026-11-13):
 """
 import datetime
 import json
+import math
 import re
 import unicodedata
 
@@ -153,9 +154,42 @@ def zone_of(data, name):
     return zone
 
 
-def units(data, a, b):
-    """Tariff units between two stops by their names, or None when either has no zone."""
-    za, zb = zone_of(data, a), zone_of(data, b)
+# ids_bbsk_stops.json: the region's own list of IDS BBSK stops with their zone and position (opendata.bbsk.sk,
+# layer "IDS - zastávky", CC BY-SA). A stop takes the zone of the nearest one within OFFICIAL_M; the name lists above
+# are the backup for a stop that isn't near any (or has no position).
+OFFICIAL_M = 250
+_grid = {}
+
+
+def _cell(lat, lon):
+    return int(lat * 100), int(lon * 100)   # about 1.1 km by 0.75 km
+
+
+def zone_at(official, lat, lon):
+    """The zone of the nearest official stop within OFFICIAL_M of (lat, lon), or None."""
+    if not _grid:
+        for _, zone, la, lo in official["stops"]:
+            _grid.setdefault(_cell(la, lo), []).append((la, lo, zone))
+    y, x = _cell(lat, lon)
+    best = None
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            for la, lo, zone in _grid.get((y + dy, x + dx), ()):
+                m = math.hypot((lo - lon) * 111_320 * math.cos(math.radians(lat)), (la - lat) * 110_540)
+                if m <= OFFICIAL_M and (best is None or m < best[0]):
+                    best = (m, zone)
+    return best[1] if best else None
+
+
+def stop_zone(data, official, stop):
+    """A planner stop ({"name", "lat", "lon"}): by its position among the official stops, else by its name."""
+    zone = zone_at(official, stop["lat"], stop["lon"]) if official and stop.get("lat") is not None else None
+    return zone if zone is not None else zone_of(data, stop.get("name") or "")
+
+
+def units(data, a, b, official=None):
+    """Tariff units between two stops (names, or {"name", "lat", "lon"}), or None when either has no zone."""
+    za, zb = ((stop_zone(data, official, s) if isinstance(s, dict) else zone_of(data, s)) for s in (a, b))
     if za is None or zb is None:
         return None
     return data["units"].get(f"{min(za, zb)}-{max(za, zb)}")
@@ -211,4 +245,11 @@ if __name__ == "__main__":
     assert units(zones, "Zvolen, AS", "Banská Bystrica, AS") == units(zones, "Banská Bystrica, AS", "Zvolen, AS") == 25
     assert units(zones, "Zvolen, AS", "Zvolen, Lipovec") == 1 and units(zones, "Zvolen, AS", "Brno") is None
     assert price(table, "ids-bbsk", units=25) == 99
+    official = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ids_bbsk_stops.json"), encoding="utf-8"))
+    # Zvolen, AS and Banská Bystrica, AS by position; a stop far from every official one falls back to its name.
+    zv, bb = {"name": "Zvolen, AS", "lat": 48.5762, "lon": 19.1371}, {"name": "Banská Bystrica, AS", "lat": 48.7355, "lon": 19.1563}
+    assert zone_at(official, zv["lat"], zv["lon"]) == 650 and zone_at(official, bb["lat"], bb["lon"]) == 600
+    assert units(zones, zv, bb, official) == 25 and zone_at(official, 48.0, 17.0) is None
+    assert stop_zone(zones, official, {"name": "Zvolen, Lipovec", "lat": 48.0, "lon": 17.0}) == 650
+    assert stop_zone(zones, official, {"name": "Zvolen, Lipovec", "lat": None, "lon": None}) == 650
     print("fares ok")

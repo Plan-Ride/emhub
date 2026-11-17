@@ -43,7 +43,87 @@ DEFAULT_FEEDS = ",".join([
     "sad-poprad-as", "sad-presov-sk", "sad-humenne-as", "sad-dunajska-streda-as", "arriva-liorbus-as",
     "arriva-michalovce-as", "arriva-nitra-as", "arriva-nove-zamky-as", "arriva-trnava-as", "eurobus-as",
     "ids-bk_regional", "dpmp", "slovak-lines-express-as", "regiojet-as", "a-express-sro",
-    "cestovna-kancelaria-daka"])
+    "cestovna-kancelaria-daka", "zsr", "dpb", "mhd-pezinok", "mhd-malacky", "mhd-topolcany"])
+# 1.56.0: feeds published openly by their owners, fetched from there (all CC BY 4.0; named on the website's and the
+# app's Data sources pages). A feed not listed here comes from our CIS conversion, else transiq.
+FEED_SOURCES = {
+    # 1.57.0: ŽSR's trains from the national open data catalogue (CC BY 1.0); its download link changes with every
+    # upload, so the catalogue is asked for the current one.
+    "zsr": "nkod:ebeeedf1-aca2-451a-bdc0-35d536714888",
+    "dpb": "https://www.arcgis.com/sharing/rest/content/items/aba12fd2cbac4843bc7406151bc66106/data",  # data.bratislava.sk
+    "mhd-pezinok": "https://github.gtfs.sk/azlines/pezinok.zip",      # gtfs.sk
+    "mhd-malacky": "https://github.gtfs.sk/azlines/malacky.zip",
+    "mhd-topolcany": "https://github.gtfs.sk/azlines/topolcany.zip",
+}
+# City feeds name their stops without the town ("Hlavná stanica"); the town goes in front, as in the regional feeds
+# ("Bratislava, Hlavná stanica"), unless the name starts with a village the other feeds know ("Malé Bedzany, rázcestie").
+FEED_TOWN = {"dpb": "Bratislava", "mhd-pezinok": "Pezinok", "mhd-malacky": "Malacky", "mhd-topolcany": "Topoľčany"}
+
+
+def source_url(feed):
+    """Where a FEED_SOURCES feed is downloaded from now ("nkod:<dataset>": the catalogue's current file)."""
+    url = FEED_SOURCES[feed]
+    if not url.startswith("nkod:"):
+        return url
+    body = json.dumps({"language": "sk", "page": 1, "pageSize": 1, "filters": {"id": [url[5:]]}, "requiredFacets": []}).encode()
+    request = urllib.request.Request("https://data.slovensko.sk/datasets/search", body, {"Content-Type": "application/json",
+                                                                                       "User-Agent": "emhub"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        item = json.load(response)["items"][0]
+    return next(d["downloadUrl"] for d in item["distributions"] if d.get("downloadUrl"))
+
+
+# ŽSR writes its stations short and without a comma ("Zvolen osob.st.", "Žiar n.Hronom"); the apps show them as the bus
+# stops are written: "Zvolen, osobná stanica", "Žiar nad Hronom, železničná stanica". Abroad ("Praha hl.n.") stays.
+RAIL_FEEDS = {"zsr"}
+RAIL_WORDS = [(r"\bosob\.\s*st\.?", "osobná stanica"), (r"\bhl\.\s*st\.?", "hlavná stanica"),
+              (r"\bnákl\.\s*st\.?", "nákladná stanica"), (r"\bzast\.?$", "zastávka"),
+              (r"\bn\.\s*(?=\w)", "nad "), (r"\bp\.\s*(?=\w)", "pod ")]
+
+
+def rail_name(name, towns):
+    """towns: folded town -> the town as the bus stops write it."""
+    full = name.strip()
+    for pattern, words in RAIL_WORDS:
+        full = re.sub(pattern, words, full)
+    parts = [p for p in re.split(r"[\s,\-]+", full) if p]
+    for k in range(len(parts), 0, -1):
+        town = towns.get(town_key(" ".join(parts[:k])))
+        if town:
+            return f"{town}, {' '.join(parts[k:]) or 'železničná stanica'}"
+    return full
+
+
+# 1.57.0: the three kinds of transport the apps can switch: buses between towns, city transport, trains.
+GROUPS = ("bus", "city", "rail")
+OLD_APPS = frozenset({"bus", "city"})   # a request without "modes": an app from before trains
+
+
+def parse_groups(text):
+    """The "modes" parameter ("bus,city,rail") as a set; missing or empty: buses and city transport, as before trains."""
+    groups = frozenset(x for x in str(text or "").split(",") if x in GROUPS)
+    return groups or OLD_APPS
+
+
+def trip_group(trip):
+    if trip[5] == "rail":
+        return "rail"
+    return "city" if trip[0] in CITY_FEEDS or trip[5] in ("tram", "trolleybus") else "bus"
+
+
+def with_town(name, town, known, lat=None, lon=None):
+    """known: town or village -> where its stops are. A village keeps its own name only when it is near (Topoľčany's
+    "Malé Bedzany"); Bratislava's "Studená" is a street there, not the village by Fiľakovo."""
+    first = name.split(",")[0].strip()
+    near = lat is not None and any(meters(lat, lon, a, b) < 15_000 for a, b in known.get(first, ()))
+    return name if first == town or near else f"{town}, {name}"
+
+
+def town_key(town):
+    """A town's name for matching, abbreviations written out: "Žiar n.Hronom" and "Žiar nad Hronom" are one town."""
+    for pattern, words in RAIL_WORDS[4:]:
+        town = re.sub(pattern, words, town)
+    return " ".join(fold(town))
 
 CHANGE_S = 60             # changing vehicles at one station (cp.sk allows 1 min at the same stop, EM-0022)
 WALK_M = 500              # stations this close are joined by a footpath (EM-0105: Zvolen EUROPA SC - Nám.SNP is 415 m)
@@ -57,6 +137,7 @@ SLACK_S, SLACK_SHARE = 10 * 60, 0.15  # a journey with fewer changes may arrive 
 MODES = {0: "tram", 2: "rail", 3: "bus", 11: "trolleybus", 200: "coach"}
 NEVER = ("deleted", "")    # the service of a trip whose stops were deleted in the map editor: no day
 CITY_FEED = "sad-zvolen-as-city"   # S.A.D. Zvolen city buses read from sadzv (sadzv.collect)
+CITY_FEEDS = {CITY_FEED, "dpb", "mhd-pezinok", "mhd-malacky", "mhd-topolcany", "dpmp"}   # city transport (the "city" group)
 def city_operator(lat):
     """sadzv doesn't say who runs a line (DPMBB or S.A.D. Zvolen in Banská Bystrica), so name the city's transport."""
     return "MHD Banská Bystrica" if lat and lat > 48.66 else "MHD Zvolen"
@@ -444,7 +525,7 @@ class Timetable:
             self.trips[index] = trip[:7] + tuple(tuple(part[k] for k in keep) for part in trip[7:11])
             if city:
                 self.city[index] = city[:4] + (tuple(city[4][k] for k in keep),)
-        for cache in ("_trip_boxes", "_stops_at", "_busy"):  # worked out from the trips' stops: again on next use
+        for cache in ("_trip_boxes", "_stops_at", "_busy", "_station_groups", "_town_index"):  # from the trips' stops: again on next use
             self.__dict__.pop(cache, None)
         self._chains = {}
         with self._lock:
@@ -606,12 +687,24 @@ class Timetable:
                     continue
                 days = self.services.setdefault((feed, r["service_id"]), set())
                 (days.add if r["exception_type"] == "1" else days.discard)((d - self.first_day).days)
+            town = FEED_TOWN.get(feed)
+            # The towns and villages of the feeds read before (the city feeds come last in the list).
+            known = {}
+            if town or feed in RAIL_FEEDS:
+                for name, la, lo, *_ in stops.values():
+                    places = known.setdefault(name.split(",")[0].strip(), [])
+                    if la is not None and len(places) < 20:
+                        places.append((la, lo))
+            rail_towns = {town_key(k): k for k in known} if feed in RAIL_FEEDS else None
             for r in rows("stops.txt"):
                 if r.get("location_type") not in (None, "", "0"):
                     continue
                 lat, lon = float(r["stop_lat"] or 0), float(r["stop_lon"] or 0)
                 ok = 47 < lat < 51 and 16 < lon < 23.5 or 35 < lat < 60 and 5 < lon < 30
-                stops[(feed, r["stop_id"])] = (clean_name(r["stop_name"]), lat if ok else None, lon if ok else None,
+                name = clean_name(r["stop_name"])
+                name = (rail_name(name, rail_towns) if rail_towns is not None
+                        else with_town(name, town, known, lat if ok else None, lon if ok else None) if town else name)
+                stops[(feed, r["stop_id"])] = (name, lat if ok else None, lon if ok else None,
                                                (r.get("platform_code") or "").strip())
             agencies = {r.get("agency_id", ""): r["agency_name"].strip() for r in rows("agency.txt")}
             routes = {r["route_id"]: (r["route_short_name"].strip() or r["route_long_name"].strip(),
@@ -738,7 +831,7 @@ class Timetable:
                     "directions": e.get("directions") or []}
             self.children.setdefault(parent, []).append((child, info))
             self.parent_of[child] = (parent, info)
-        for cache in ("_search_words", "_towns"):  # built from the names
+        for cache in ("_search_words", "_towns", "_station_groups", "_town_index"):  # built from the names
             self.__dict__.pop(cache, None)
         if self.deleted != was:
             self._cut()
@@ -1165,8 +1258,11 @@ class Timetable:
 
     # ---- per-day connections
 
-    def day(self, d):
-        """Connections usable on day d: that day's trips, the previous day's after midnight, the next day's."""
+    def day(self, d, groups=None):
+        """Connections usable on day d: that day's trips, the previous day's after midnight, the next day's.
+        groups: only these kinds of transport (GROUPS); a day of each choice is kept like the whole one."""
+        if groups is not None and set(GROUPS) - set(groups):
+            return self._filtered_day(d, frozenset(groups))
         with self._lock:
             cached = self._days.get(d)
             if cached:
@@ -1178,6 +1274,84 @@ class Timetable:
             with self._lock:
                 cached = self._days.get(d)
             return cached or self._build_day(d)
+
+    def _filtered_day(self, d, groups):
+        key = (d, groups)
+        with self._lock:
+            cached = self._days.get(key)
+        if cached:
+            return cached
+        full = self.day(d)
+        with self._building:
+            with self._lock:
+                cached = self._days.get(key)
+            if cached:
+                return cached
+            allowed = [trip_group(trip) in groups for trip in self.trips]
+            day = Day(d, full.base, [c for c in full.conns if allowed[c[4] // 3]], full.vehicle)
+            with self._lock:
+                if len(self._days) >= 6:
+                    self._days.pop(next(iter(self._days)))
+                self._days[key] = day
+            return day
+
+    def station_groups(self):
+        """Per station: the kinds of transport stopping there."""
+        if len(getattr(self, "_station_groups", ())) != len(self.names):  # stations added since (lines, map edits)
+            groups = [set() for _ in self.names]
+            for trip in self.trips:
+                g = trip_group(trip)
+                for s in trip[7]:
+                    groups[s].add(g)
+            self._station_groups = groups
+        return self._station_groups
+
+    def rail_only(self, s):
+        return self.station_groups()[s] == {"rail"}
+
+    def towns(self):
+        """
+        1.57.0: towns with more than one station, folded name -> (name, main stations). A town's main stations are its
+        busiest bus station (its AS when it has one) and its busiest train station: a search from a town starts there.
+        """
+        if not hasattr(self, "_town_index"):
+            groups, members = self.station_groups(), {}
+            for s, name in enumerate(self.names):
+                if "," in name and s not in self.deleted and groups[s]:
+                    town = name.split(",")[0].strip()
+                    entry = members.setdefault(town_key(town), [town, []])
+                    if len(town) > len(entry[0]):
+                        entry[0] = town   # "Žiar nad Hronom" rather than "Žiar n.Hronom"
+                    entry[1].append(s)
+
+            def main(stations, group, preferred):
+                found = [s for s in stations if group in self.station_groups()[s]]
+                return max(found, key=lambda s: (fold(self.names[s].split(",", 1)[1])[:2] in preferred, self.weight[s]), default=None)
+
+            index = {}
+            for key, (town, stations) in members.items():
+                if len(stations) < 2:
+                    continue
+                bus = main(stations, "bus", (["as"], ["aut", "st"], ["autobusova", "stanica"]))
+                rail = main(stations, "rail", (["hlavna", "stanica"], ["osobna", "stanica"], ["zeleznicna", "stanica"]))
+                picked = [s for s in (bus, rail) if s is not None] or [max(stations, key=lambda s: self.weight[s])]
+                index[key] = (town, picked)
+            self._town_index = index
+        return self._town_index
+
+    def town_json(self, key):
+        town, picked = self.towns()[key]
+        return {"id": "town:" + key.replace(" ", "-"), "name": town, "town": True,
+                "lat": self.lat[picked[0]], "lon": self.lon[picked[0]],
+                "modes": sorted(set().union(*(self.station_groups()[s] for s in picked)))}
+
+    def resolve_many(self, value):
+        """A town ("town:zvolen"): its main stations; else the one station resolve() finds. [] when nothing fits."""
+        if str(value).startswith("town:"):
+            hit = self.towns().get(str(value)[5:].replace("-", " "))
+            return list(hit[1]) if hit else []
+        s = self.resolve(value)
+        return [] if s is None else [s]
 
     def _build_day(self, d):
         n = (d - self.first_day).days
@@ -1203,7 +1377,7 @@ class Timetable:
                 vehicle[rb] = vehicle.get(ra, ra)
         day = Day(d, base, conns, vehicle)
         with self._lock:
-            if len(self._days) >= 4:
+            if len(self._days) >= 6:
                 self._days.pop(next(iter(self._days)))
             self._days[d] = day
         return day
@@ -1216,7 +1390,8 @@ class Timetable:
     # ---- API helpers
 
     def station_json(self, s):
-        return {"id": self.station_ids[s], "name": self.names[s], "lat": self.lat[s], "lon": self.lon[s]}
+        return {"id": self.station_ids[s], "name": self.names[s], "lat": self.lat[s], "lon": self.lon[s],
+                "modes": sorted(self.station_groups()[s])}
 
     def search_words(self):
         """
@@ -1241,31 +1416,43 @@ class Timetable:
                     town = fold(self.names[o].split(",")[0])
                     if town != words[s][:len(town)]:
                         words[s] = town + words[s]
+            for s in range(len(words)):
+                if self.rail_only(s):
+                    words[s] = words[s] + ["vlak"]   # "zvolen vlak" finds the train station
             self._search_words = words
         return self._search_words
 
-    def search(self, text, limit=18):
+    def search(self, text, limit=18, groups=OLD_APPS, towns=False):
+        """towns: a matching town comes first ("Zvolen", the whole town). Train-only stations only when groups has rail."""
         tokens = fold(text)
         if not tokens:
             return []
         found = []
+        if towns:
+            for key, (town, _) in self.towns().items():
+                score = match_score(tokens, key.split())
+                if score is not None and len(tokens) <= len(key.split()):
+                    found.append((-score - 100, 0, town, ("town", key)))
         for s, words in enumerate(self.search_words()):
             if not words or s in self.deleted or tokens[0][0] not in {w[0] for w in words}:
+                continue
+            if "rail" not in groups and self.rail_only(s):
                 continue
             score = match_score(tokens, words)
             if score is not None:
                 found.append((-score, -self.weight[s], self.names[s], s))
-        found.sort()
-        return [self.station_json(s) for *_, s in found[:limit]]
+        found.sort(key=lambda x: x[:3])
+        return [self.town_json(s[1]) if isinstance(s, tuple) else self.station_json(s) for *_, s in found[:limit]]
 
-    def near(self, lat, lon, radius=300, limit=10):
+    def near(self, lat, lon, radius=300, limit=10, groups=OLD_APPS):
         def distance(s):
             if self.in_zone(s, lat, lon):
                 return 0.0
             return min([meters(lat, lon, self.lat[s], self.lon[s])] + [meters(lat, lon, p["lat"], p["lon"]) for p in self.places.get(s, ())])
         found = sorted((distance(s), s) for s in range(len(self.names))
                        if self.lat[s] is not None and s not in self.deleted
-                       and abs(self.lat[s] - lat) < 0.05 and abs(self.lon[s] - lon) < 0.07)
+                       and abs(self.lat[s] - lat) < 0.05 and abs(self.lon[s] - lon) < 0.07
+                       and ("rail" in groups or not self.rail_only(s)))
         return [dict(self.station_json(s), meters=round(d)) for d, s in found if d <= radius][:limit]
 
     def town_center(self, s):
@@ -1289,7 +1476,7 @@ class Timetable:
         hit = self.search(value, 1)
         return self.by_id[hit[0]["id"]] if hit else None
 
-    def departures(self, stations, when, limit=30, exclude=(), ending=False):
+    def departures(self, stations, when, limit=30, exclude=(), ending=False, groups=OLD_APPS):
         """Buses leaving the stations from `when`. ending: also buses that end their trip there ("ends": true);
         sadzv lists those as departures too (Banská Bystrica city buses at a terminus, EM-0019)."""
         d = datetime.fromtimestamp(when, ZONE).date()
@@ -1311,6 +1498,8 @@ class Timetable:
                         continue
                     if any(trip[0].startswith(x) for x in exclude):  # "sad-zvolen-as" also drops its city buses
                         continue
+                    if trip_group(trip) not in groups:
+                        continue
                     rows.append((day.base + at, trip, service_day, k + arriving, s, arriving))
         rows.sort(key=lambda r: r[0])
         out, seen = [], set()
@@ -1327,7 +1516,8 @@ class Timetable:
                     end = self.trips[chain[-1][2]]
                     headsign, continues = end[3] or self.names[end[7][-1]], self.continues_json(chain, service_day)
             out.append({"at": at * 1000, "tripId": f"{trip[0]}:{trip[1]}:{service_day:%Y%m%d}", "line": trip[2],
-                        "headsign": headsign, "operator": trip[4], "mode": trip[5], **({"continues": continues} if continues else {}),
+                        "headsign": headsign, "operator": trip[4], "mode": trip[5], "group": trip_group(trip),
+                        **({"continues": continues} if continues else {}),
                         "platform": (set_up[2] if set_up and set_up[2] else trip[10][k]), "stop": self.station_json(s), "seq": k, "feed": trip[0],
                         **({"ends": True} if arriving else {})})
             if len(out) >= limit:
@@ -1416,14 +1606,37 @@ class Timetable:
 
     # ---- connection search (CSA)
 
-    def plan(self, origin, target, when, count=5, direct=False, change=CHANGE_S, walk_start=True):
+    def plan_many(self, origins, targets, when, count=5, direct=False, change=CHANGE_S, walk_start=True, groups=None, walk_end=True):
+        """
+        1.57.0: connections from any of `origins` to any of `targets` (a town's main bus and train station): each pair
+        searched, then merged. A connection another one beats (leaves no earlier, arrives no later, with no more vehicles)
+        is dropped. Two train-only stations: trains only, whatever the rider switched on.
+        """
+        if len(origins) == 1 and len(targets) == 1 and self.rail_only(origins[0]) and self.rail_only(targets[0]):
+            groups = frozenset({"rail"})
+        found = []
+        for o in origins:
+            for t in targets:
+                if o != t:
+                    found += self.plan(o, t, when, count, direct, change, walk_start, groups, walk_end)
+        vehicles = lambda j: sum(leg["type"] == "trip" for leg in j["legs"])  # noqa: E731
+        found.sort(key=lambda j: (j["departure"], j["arrival"], vehicles(j)))
+        kept = []
+        for j in found:
+            if any(k["departure"] >= j["departure"] and k["arrival"] <= j["arrival"] and vehicles(k) <= vehicles(j) for k in kept):
+                continue
+            kept = [k for k in kept if not (j["departure"] >= k["departure"] and j["arrival"] <= k["arrival"]
+                                            and vehicles(j) <= vehicles(k))] + [j]
+        return sorted(kept, key=lambda j: j["departure"])[:count]
+
+    def plan(self, origin, target, when, count=5, direct=False, change=CHANGE_S, walk_start=True, groups=None, walk_end=True):
         """
         Up to `count` connections leaving `origin` from `when` (epoch s). Each is the one with the
         fewest vehicles that arrives at most a little later than the fastest, and among equal
         arrivals the one that leaves last. change: the least time between two buses (s), the rider's setting.
         walk_start=False: board at `origin` itself, no walk to another stop first (a change stop the rider chose).
         """
-        day = self.day(datetime.fromtimestamp(when, ZONE).date())
+        day = self.day(datetime.fromtimestamp(when, ZONE).date(), groups)
         t = when - day.base
         out = []
         for _ in range(count * 4):
@@ -1438,6 +1651,10 @@ class Timetable:
                 break
             journey = self._journey(day, self._tidy(day, legs, origin, target, t, change))
             buses = lambda j: sum(leg["type"] == "trip" for leg in j["legs"])  # noqa: E731
+            if not walk_end and journey["legs"][-1]["type"] == "walk":
+                # 2.18.0: the rider doesn't want to walk to another stop: only buses that stop at the searched one.
+                t = (day.conns[legs[0][1]][0] if legs[0][0] == "trip" else legs[0][2]) + 60
+                continue
             if out and out[-1]["arrival"] == journey["arrival"]:
                 # Same arrival, later start: better only without an extra change. A city bus that
                 # catches the same regional bus further on must not replace that direct bus (EM-0014).
@@ -1701,7 +1918,7 @@ class Timetable:
             trip, service_day = self.run_trip(day, first[4])
             to_trip, to_k = self.run_trip(day, last[4])[0], last[5] + 1
             out.append({"type": "trip", "tripId": f"{trip[0]}:{trip[1]}:{service_day:%Y%m%d}", "line": trip[2],
-                        "headsign": trip[3] or self.names[trip[7][-1]], "operator": trip[4], "mode": trip[5],
+                        "headsign": trip[3] or self.names[trip[7][-1]], "operator": trip[4], "mode": trip[5], "group": trip_group(trip),
                         "from": self.leg_stop(first[2], trip, first[5]), "to": self.leg_stop(last[3], to_trip, to_k),
                         "departure": (day.base + first[0]) * 1000, "arrival": (day.base + last[1]) * 1000})
             if first[4] != last[4]:
@@ -1845,8 +2062,77 @@ def inside_polygon(lat, lon, points):
 # stations' extra places, zones and the central flag {"name", "places": [{"label", "platform", "lat", "lon", "lines", "directions"}],
 # "zone", "central"}; and sub-stations of central stations {"name", "parent", "label", "platform", "lines", "directions"} by the
 # sub-station's id. A direction is {"name", "lines", "towards"}; "lines" of a place is all its directions' lines together.
-edits = {"stops": {}, "segments": {}, "stations": {}, "children": {}, "routes": {}, "vias": {}, "extra_stations": [], "extra_trips": [],
-         "links": []}
+# 1.58.0: train parts follow the railway. gtfs.sk's copy of ŽSR's feed has each train's shape traced along
+# OpenStreetMap's railways (© OpenStreetMap contributors, ODbL); only the shapes are taken from it, the timetable stays
+# ŽSR's own. "a>b" (station ids) -> points; a part drawn or snapped in the dashboard wins over it.
+RAIL_SHAPES = "zsr-shapes"
+RAIL_SHAPES_URL = "https://github.gtfs.sk/modified-zsr-feed/gtfs.zip"
+rail_traces = {}
+
+
+class TraceMap(dict):
+    """The traces drawn and snapped in the dashboard (the database), with the railway traces under them."""
+
+    def get(self, key, default=None):
+        return dict.__getitem__(self, key) if dict.__contains__(self, key) else rail_traces.get(key, default)
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or key in rail_traces
+
+    def __getitem__(self, key):
+        return dict.__getitem__(self, key) if dict.__contains__(self, key) else rail_traces[key]
+
+
+def rail_shapes(path):
+    """{train as written ("Os 7336", "EC 120"): [(lat, lon), …]} from gtfs.sk's copy of ŽSR's feed."""
+    with zipfile.ZipFile(path) as zf:
+        def rows(name):
+            return csv.DictReader(io.TextIOWrapper(zf.open(name), "utf-8-sig"))
+        shape_of = {}
+        for r in rows("trips.txt"):
+            if r.get("shape_id"):
+                shape_of.setdefault((r.get("trip_short_name") or "").strip(), r["shape_id"])
+        points = {}
+        for r in rows("shapes.txt"):
+            points.setdefault(r["shape_id"], []).append((int(r["shape_pt_sequence"]), float(r["shape_pt_lat"]), float(r["shape_pt_lon"])))
+    shapes = {sid: [(a, b) for _, a, b in sorted(p)] for sid, p in points.items()}
+    return {train: shapes[sid] for train, sid in shape_of.items() if sid in shapes}
+
+
+def build_rail_traces(t, shapes):
+    """The railway between each two stations a train stops at, cut from the train's shape (stations within 400 m of it)."""
+    traces, ids = {}, t.station_ids
+    for trip in t.trips:
+        if trip[0] not in RAIL_FEEDS:
+            continue
+        stops = trip[7]
+        keys = [f"{ids[a]}>{ids[b]}" for a, b in zip(stops, stops[1:])]
+        shape = shapes.get(trip[2])
+        if not shape or all(k in traces for k in keys):
+            continue
+        scale = math.cos(math.radians(shape[0][0]))
+        at, prev = 0, None
+        for k, s in enumerate(stops):
+            if t.lat[s] is None:
+                prev = None
+                continue
+            la, lo = t.lat[s], t.lon[s]
+            best, where = math.inf, None
+            for i in range(at, len(shape)):
+                d = (shape[i][0] - la) ** 2 + ((shape[i][1] - lo) * scale) ** 2
+                if d < best:
+                    best, where = d, i
+            if where is None or math.sqrt(best) * 111_000 > 400:
+                prev = None
+                continue
+            if prev is not None and where > prev and keys[k - 1] not in traces:
+                traces[keys[k - 1]] = [list(p) for p in shape[prev:where + 1]]
+            prev, at = where, where
+    return traces
+
+
+edits = {"stops": {}, "segments": TraceMap(), "stations": {}, "children": {}, "routes": {}, "vias": {}, "extra_stations": [],
+         "extra_trips": [], "links": []}
 
 
 # ------------------------------------------------------------------ downloads, the daily refresh, the log
@@ -1889,18 +2175,23 @@ def download(folder, feeds):
     Our CIS conversion first; only a feed it doesn't have (404) falls back to transiq."""
     folder.mkdir(parents=True, exist_ok=True)
     changed = 0
+    if any(f in feeds for f in RAIL_FEEDS):
+        try:
+            fetch(RAIL_SHAPES_URL, folder / f"{RAIL_SHAPES}.zip")
+        except Exception as error:  # noqa: BLE001 - the previous shapes stay
+            log(f"railway shapes: {error}")
     for feed in feeds:
         path = folder / f"{feed}.zip"
         try:
             try:
-                url = CIS_URL.format(feed) if CIS_URL else FEED_URL.format(feed)
+                url = source_url(feed) if feed in FEED_SOURCES else CIS_URL.format(feed) if CIS_URL else FEED_URL.format(feed)
                 data = fetch(url, path)
             except urllib.error.HTTPError as error:
-                if not CIS_URL or error.code != 404:
+                if feed in FEED_SOURCES or not CIS_URL or error.code != 404:
                     raise
                 url = FEED_URL.format(feed)
                 data = fetch(url, path)
-            origin = "cis" if url != FEED_URL.format(feed) else "transiq"
+            origin = "official" if feed in FEED_SOURCES else "cis" if url != FEED_URL.format(feed) else "transiq"
             result = "unchanged" if data is None else f"updated ({len(data) // 1024} kB, {origin})"
             changed += data is not None
         except urllib.error.HTTPError as error:
@@ -1932,6 +2223,19 @@ def load(folder, feeds):
     today = datetime.now(ZONE).date()
     for d in (today - timedelta(days=1), today, today + timedelta(days=1)):  # the map's buses now and the first search mustn't wait
         built.day(d)
+    # 1.57.0: today without trains (apps before 2.18.0), towns and the search words ready too, and the planner's arrays.
+    built.towns()
+    built.search_words()
+    for day in (built.day(today), built.day(today, OLD_APPS)):
+        if NATIVE is not None:
+            _native_net(built, day)
+    shapes = folder / f"{RAIL_SHAPES}.zip"
+    if any(f in paths for f in RAIL_FEEDS) and shapes.exists():
+        try:
+            global rail_traces
+            rail_traces = build_rail_traces(built, rail_shapes(shapes))
+        except Exception as error:  # noqa: BLE001 - trains drawn straight, nothing worse
+            log(f"railway shapes not read: {error}")
     current = built
     for step in on_loaded:
         try:

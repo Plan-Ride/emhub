@@ -29,6 +29,24 @@ The first start creates the admin from `HUB_BOOTSTRAP_USER` / `HUB_BOOTSTRAP_PAS
 
 Self-check: `python3 test_hub.py`.
 
+## Fares and data sources
+
+What a ride costs comes from the carriers' public price lists (`fares.py`, changed in the dashboard under
+Settings, Fares). IDS BBSK fares go by tariff zones:
+
+- `ids_bbsk_stops.json`: the IDS BBSK stops with their zone and position, from the
+  [open data portal of the Banská Bystrica Self-Governing Region](https://opendata.bbsk.sk/) (layer "IDS - zastávky",
+  licence **CC BY-SA**). A planner stop takes the zone of the nearest official stop within 250 m. Because of the
+  share-alike licence, this file is shared under CC BY-SA as well, whatever the rest of the repository's licence says.
+- `ids_bbsk_zones.json`: the tariff units between zones and, as a backup for stops the official list doesn't place,
+  the stops' zones by name, both from the IDS BBSK transport rules (Príloha 6 and 7, idsbbsk.sk).
+
+City timetables published openly by their owners (`FEED_SOURCES` in `timetable.py`, all CC BY 4.0): Bratislava
+(DPB) from [opendata.bratislava.sk](https://opendata.bratislava.sk/), Pezinok, Malacky and Topoľčany from [gtfs.sk](https://gtfs.sk/).
+
+Other open data the apps use: maps and walking routes © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright)
+(ODbL), weather from [Open-Meteo](https://open-meteo.com/) (CC BY 4.0).
+
 ## Website
 
 Each page is an HTML fragment: `site/<page>.<lang>.html` is the default, an edited version is stored in the database (`site_pages`). `site/layout.html` adds the header, menu, language switch and footer around it. Page titles and menu labels are in `SITE_PAGES` in `hub.py`. When the site moves to a new address, set `HUB_PUBLIC_URL` to it and list the old one in `HUB_EXTRA_ORIGINS` so the dashboard keeps working there.

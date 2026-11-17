@@ -284,7 +284,7 @@
   .mode-filter { margin: 0 0 6px; padding: 0 28px; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
   .mode-filter label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
   @media (max-width: 900px) { .mode-filter { padding: 0 16px; } }
-  .bus-icon.rail { border-radius: 3px; border-color: #111; }
+  .bus-icon.train { border-radius: 3px; border-color: #111; }
   .op-filter { margin: 0 0 8px; padding: 0 28px; }
   .op-filter[open] { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
   .op-filter summary { cursor: pointer; width: 100%; }
@@ -2275,7 +2275,7 @@ async function loadBuses() {
   for (const c of cities.filter((x) => !hiddenOps.has(x.name))) {
     for (const v of live.vehicles.filter((x) => x.city === c.id && modeShown(x) && map.getBounds().contains([x.Latitude / 1e5, x.Longitude / 1e5]))) {
       const late = v.Delay >= 600 ? "very" : v.Delay >= 180 ? "late" : "";
-      const icon = L.divIcon({ className: "", html: `<div class="bus-icon live ${late} ${isTrain(v) ? "rail" : ""}">${esc(v.LineNumberText || "?")}</div>`, iconSize: null });
+      const icon = L.divIcon({ className: "", html: `<div class="bus-icon live ${late} ${isTrain(v) ? "train" : ""}">${esc(v.LineNumberText || "?")}</div>`, iconSize: null });
       const m = L.marker([v.Latitude / 1e5, v.Longitude / 1e5], { icon });
       m.bindTooltip(`${esc(c.name)}: ${esc(v.LineNumberText || "no line")}${v.Destination ? " → " + esc(v.Destination) : ""}<br>${v.Delay != null ? esc(delayText(v.Delay).text) + "<br>" : ""}${v.source === "portal" ? "city map page" : esc(v.Speed ?? "?") + " km/h"}, ${esc((v.Licence || "").trim())}`);
       if (v.source === "portal") m.on("click", () => showPortalLine(v));
@@ -2284,7 +2284,7 @@ async function loadBuses() {
   }
   for (const v of r.vehicles.filter((x) => !hiddenOps.has(x.operator) && modeShown(x))) {
     const late = v.delay != null && v.delay >= 600 ? "very" : v.delay != null && v.delay >= 180 ? "late" : "";
-    const icon = L.divIcon({ className: "", html: `<div class="bus-icon ${v.live ? "live" : ""} ${late} ${isTrain(v) ? "rail" : ""}">${esc(v.line)}</div>`, iconSize: null });
+    const icon = L.divIcon({ className: "", html: `<div class="bus-icon ${v.live ? "live" : ""} ${late} ${isTrain(v) ? "train" : ""}">${esc(v.line)}</div>`, iconSize: null });
     const m = L.marker([v.lat, v.lon], { icon });
     const d = delayText(v.delay);
     m.bindTooltip(`${esc(v.line)} → ${esc(v.headsign)}<br>next: ${esc(v.next)}<br>${v.live ? `${d.text} (${v.source === "gps" ? "riders' phones" : v.source === "bus" ? "the bus's own GPS" : v.source === "city" ? "the city's map page" : "reports"})` : "timetable"}`);

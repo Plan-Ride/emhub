@@ -57,7 +57,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.54.0"
+VERSION = "1.58.1"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -463,7 +463,7 @@ def load_map_edits():
                                                       "origLat": r["orig_lat"] if r["orig_lat"] is not None else r["lat"],
                                                       "origLon": r["orig_lon"] if r["orig_lon"] is not None else r["lon"]}
                                     for r in conn.execute("SELECT * FROM map_stops")}
-        timetable.edits["segments"] = {r["segment"]: json.loads(r["points"]) for r in conn.execute("SELECT segment, points FROM map_segments")}
+        timetable.edits["segments"] = timetable.TraceMap({r["segment"]: json.loads(r["points"]) for r in conn.execute("SELECT segment, points FROM map_segments")})
         timetable.edits["stations"] = {r["station_id"]: dict(json.loads(r["data"]), name=r["name"]) for r in conn.execute("SELECT * FROM map_stations")}
         timetable.edits["children"] = {r["child_id"]: dict(json.loads(r["data"]), name=r["name"], parent=r["parent_id"])
                                        for r in conn.execute("SELECT * FROM map_children")}
@@ -625,7 +625,7 @@ def map_conflict(tab, targets):
 def set_trace(key, points):
     """One part's trace into the edits in use (None removes it), without reading all the tables again."""
     with _map_lock:
-        traces = dict(timetable.edits.get("segments", {}))  # a copy: readers keep the one they hold
+        traces = timetable.TraceMap(timetable.edits.get("segments", {}))  # a copy: readers keep the one they hold
         if points is None:
             traces.pop(key, None)
         else:
@@ -1017,19 +1017,22 @@ OFFLINE_DAYS = 21
 _offline = {}
 
 
-def offline_region(t, rid):
+def offline_region(t, rid, rail=False):
     """
     A region's timetable for the apps to keep (next 21 days): its stations and every trip with two or more stops in it
     (cut to those). Cached per timetable build; the version tells the apps when to download it again.
     """
-    key = (rid, int(t.built))
+    key = (rid, int(t.built), rail)   # 2.18.0 asks with rail=1: its trains come too, with "modes" per trip
     if key not in _offline:
         south, west, north, east = OFFLINE_REGIONS[rid][1]
         inside = [s for s in range(len(t.names)) if t.lat[s] is not None and south <= t.lat[s] <= north and west <= t.lon[s] <= east]
         index = {s: i for i, s in enumerate(inside)}
         today = (datetime.now(timetable.ZONE).date() - t.first_day).days
         trips, packed, whole = [], {}, set()
+        modes = []
         for i, trip in enumerate(t.trips):
+            if not rail and timetable.trip_group(trip) == "rail":
+                continue
             kept = [k for k, s in enumerate(trip[7]) if s in index]
             if len(kept) < 2:
                 continue
@@ -1041,6 +1044,7 @@ def offline_region(t, rid):
                     whole.add(i)
                 trips.append([trip[2], trip[3] or t.names[trip[7][-1]], trip[4], [index[trip[7][k]] for k in kept],
                               [trip[9][k] for k in kept], days])
+                modes.append(timetable.trip_group(trip))
         # 2.17.2: [trip, the trip its bus goes on as (riders stay on), days]; both whole in the region (none cut short).
         # Apps before 2.17.2 skip it.
         continues = {}
@@ -1052,7 +1056,8 @@ def offline_region(t, rid):
             _offline.clear()
         _offline[key] = {"region": rid, "version": int(t.built), "from": (datetime.now(timetable.ZONE).date()).isoformat(),
                          "stations": [[t.station_ids[s], t.names[s], round(t.lat[s], 5), round(t.lon[s], 5)] for s in inside],
-                         "trips": trips, "continues": [[a, b, days] for (a, b), days in continues.items()]}
+                         "trips": trips, "continues": [[a, b, days] for (a, b), days in continues.items()],
+                         **({"modes": modes} if rail else {})}
     return _offline[key]
 
 
@@ -1350,6 +1355,9 @@ def fare_zones():
     if not _fare_zones:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ids_bbsk_zones.json"), encoding="utf-8") as f:
             _fare_zones.update(json.load(f))
+        # 1.55.0: the region's official stops with their zones (opendata.bbsk.sk, CC BY-SA) come first.
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ids_bbsk_stops.json"), encoding="utf-8") as f:
+            _fare_zones["official"] = json.load(f)
     return _fare_zones
 
 
@@ -1370,7 +1378,7 @@ def add_tariffs(journeys):
             leg["tariff"] = tariff
             if kinds[tariff] == "units":
                 # IDS BBSK: the price goes by the tariff units between the zones of the two stops.
-                n = fares.units(fare_zones(), leg["from"]["name"], leg["to"]["name"])
+                n = fares.units(fare_zones(), leg["from"], leg["to"], fare_zones().get("official"))
                 if n is not None:
                     leg["units"] = n
 
@@ -2268,7 +2276,13 @@ SITE_PAGES = {
         "sk": ("Súkromie", "Zásady ochrany súkromia Plan&Ride", "Čo aplikácia Plan&Ride posiela kam a vaše práva."),
         "en": ("Privacy", "Plan&Ride privacy policy", "What the Plan&Ride app sends where, and your rights."),
     }),
+    # 1.55.0: linked from the footer only, not the main menu.
+    "sources": ("sources", {
+        "sk": ("Zdroje údajov", "Zdroje údajov Plan&Ride", "Otvorené údaje, ktoré Plan&Ride používa, a ich licencie."),
+        "en": ("Data sources", "Plan&Ride data sources", "The open data Plan&Ride uses, and their licences."),
+    }),
 }
+SITE_FOOTER_ONLY = ("sources",)
 SITE_LANGS = ("sk", "en")
 NOINDEX = {"X-Robots-Tag": "noindex"}
 SITE_WORDS = {"sk": {"nav": "Hlavná ponuka", "admin": "Správa", "other": "English"},
@@ -2320,7 +2334,7 @@ def render_site(name, lang, content=None):
     current = ' aria-current="page"'
     nav = "".join(
         f'<a href="{site_url(n, lang)}"{current if n == name else ""}>{html.escape(p[1][lang][0])}</a>'
-        for n, p in SITE_PAGES.items()
+        for n, p in SITE_PAGES.items() if n not in SITE_FOOTER_ONLY
     )
     words = SITE_WORDS[lang]
     values = {
@@ -2328,6 +2342,7 @@ def render_site(name, lang, content=None):
         "home_url": site_url("home", lang), "url": PUBLIC_URL + site_url(name, lang), "url_sk": PUBLIC_URL + site_url(name, "sk"), "url_en": PUBLIC_URL + site_url(name, "en"),
         "lang_switch": f'<a href="{site_url(name, other)}" hreflang="{other}" lang="{other}">{words["other"]}</a>',
         "admin_label": words["admin"], "year": datetime.now(LOCAL_ZONE).year,
+        "sources_url": site_url("sources", lang), "sources_label": SITE_PAGES["sources"][1][lang][0],
         "content": site_source(name, lang) if content is None else content,
     }
     return render_template("", values, (HERE / "site" / "layout.html").read_text(encoding="utf-8"))
@@ -2770,24 +2785,27 @@ def timetable_query(route, query):
     if t is None:
         return 503, {"error": "Timetable is loading, try again in a minute"}
     limit = lambda default, top: max(1, min(top, int(query.get("n") or default)))  # noqa: E731
+    # 1.57.0: "modes" (bus,city,rail) from apps that know trains and towns; without it the answers stay as before.
+    groups, new_app = timetable.parse_groups(query.get("modes")), "modes" in query
     if route == "stops":
         if query.get("q"):
-            return 200, {"stops": t.search(query["q"], limit(18, 50))}
+            return 200, {"stops": t.search(query["q"], limit(18, 50), groups, towns=new_app)}
         if query.get("lat") and query.get("lon"):
             return 200, {"stops": t.near(float(query["lat"]), float(query["lon"]), min(2000, int(query.get("radius") or 300)),
-                                         limit(10, 50))}
+                                         limit(10, 50), groups)}
         return 400, {"error": "q or lat and lon are required"}
     if route == "departures":
         if query.get("stop"):
-            stations = [s for s in (t.by_id.get(i) for i in query["stop"].split(",")) if s is not None]
+            ids = query["stop"].split(",")
+            stations = [s for i in ids for s in (t.resolve_many(i) if i.startswith("town:") else [t.by_id.get(i)]) if s is not None]
         elif query.get("lat") and query.get("lon"):
             radius = min(1000, int(query.get("radius") or 150))
-            stations = [t.by_id[s["id"]] for s in t.near(float(query["lat"]), float(query["lon"]), radius, 20)]
+            stations = [t.by_id[s["id"]] for s in t.near(float(query["lat"]), float(query["lon"]), radius, 20, groups)]
         else:
             return 400, {"error": "stop or lat and lon are required"}
         exclude = {f for f in (query.get("exclude") or "").split(",") if f}
         return 200, {"departures": t.departures(stations, when_param(query.get("time")), limit(30, 200), exclude,
-                                                ending=query.get("ending") in ("1", "true")),
+                                                ending=query.get("ending") in ("1", "true"), groups=groups),
                      "stops": [t.station_json(s) for s in stations]}
     if route == "weather":
         try:
@@ -2804,7 +2822,7 @@ def timetable_query(route, query):
         rid = query.get("id")
         if rid not in OFFLINE_REGIONS:
             return 404, {"error": "No such region"}
-        return 200, offline_region(t, rid)
+        return 200, offline_region(t, rid, rail=query.get("rail") in ("1", "true"))
     if route == "drive":
         # EM-0072: the drive from about where the rider is to their stop, along the roads at their speeds (OSRM's car
         # profile: town streets, 90 km/h roads, 130 km/h motorways). The apps send their position rounded to ~100 m.
@@ -2840,9 +2858,11 @@ def timetable_query(route, query):
         trip = t.trip(query.get("id") or "") if re.fullmatch(r"[^:]+:.+:\d{8}", query.get("id") or "") else None
         return (200, trip) if trip else (404, {"error": "No such trip"})
     if route == "plan":
-        origin, target = t.resolve(query.get("from") or ""), t.resolve(query.get("to") or "")
-        if origin is None or target is None:
-            return 404, {"error": "Stop not found", "from": origin is not None, "to": target is not None}
+        # 1.57.0: "from"/"to" may be a town ("town:zvolen"): its main bus and train station.
+        origins, targets = t.resolve_many(query.get("from") or ""), t.resolve_many(query.get("to") or "")
+        if not origins or not targets:
+            return 404, {"error": "Stop not found", "from": bool(origins), "to": bool(targets)}
+        origin, target = origins[0], targets[0]
         when, count = when_param(query.get("time")), limit(5, 10)
         # EM-0053, "arrive by": `time` is when the rider wants to be there. Connections are searched from a few hours
         # before it and only those arriving in time are kept: the ones that leave latest.
@@ -2854,12 +2874,13 @@ def timetable_query(route, query):
         a = (t.lat[origin], t.lon[origin]) if t.lat[origin] is not None else sadzv.locate(t.names[origin], t.town_center(origin))
         b = (t.lat[target], t.lon[target]) if t.lat[target] is not None else sadzv.locate(t.names[target], t.town_center(target))
         name_of = lambda lat, lon: next((s["name"] for s in t.near(lat, lon, 120, 1)), None)  # noqa: E731
-        live_job = LIVE_POOL.submit(sadzv.journeys, a, b, when, found, name_of) if a and b else None
+        live_job = LIVE_POOL.submit(sadzv.journeys, a, b, when, found, name_of) if a and b and "city" in groups else None
         # change: the rider's least time between two buses in minutes (app setting; 0 = any), 1 by default.
         raw = str(query.get("change") or "")
         change = min(30, int(raw)) * 60 if raw.isdigit() else timetable.CHANGE_S
-        journeys = t.plan(origin, target, when, found, query.get("direct") in ("1", "true"), change,
-                          walk_start=query.get("walkstart") not in ("0", "false"))
+        journeys = t.plan_many(origins, targets, when, found, query.get("direct") in ("1", "true"), change,
+                               walk_start=query.get("walkstart") not in ("0", "false"), groups=groups,
+                               walk_end=query.get("walkend") not in ("0", "false"))
         if live_job:
             # City buses aren't in the open timetables: SAD Zvolen's live data adds its direct buses.
             live = live_job.result()
@@ -2877,7 +2898,8 @@ def timetable_query(route, query):
         journeys = journeys[:count]
         add_transfer_odds(t, journeys)
         add_tariffs(journeys)
-        return 200, {"from": t.station_json(origin), "to": t.station_json(target), "connections": journeys}
+        end = lambda value, s: t.town_json(value[5:].replace("-", " ")) if str(value).startswith("town:") else t.station_json(s)  # noqa: E731
+        return 200, {"from": end(query.get("from") or "", origin), "to": end(query.get("to") or "", target), "connections": journeys}
     return 404, {"error": "Not found"}
 
 
@@ -4632,6 +4654,9 @@ class Handler(BaseHTTPRequestHandler):
                 if data.get("from") and (seg["from"], seg["to"]) != (data.get("from"), data.get("to")):
                     continue
                 if len(seg["points"]) < 2 or (data.get("keep") and seg["traced"]) or (drawn_by_hand(key) and not data.get("force")):
+                    continue
+                # 1.58.0: a train part follows the railway (gtfs.sk); the road router would pull it onto a road.
+                if key in timetable.rail_traces and not data.get("force"):
                     continue
                 try:
                     # Not under the map lock: several people snap at once, and the others' saves go on meanwhile.
