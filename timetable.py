@@ -1621,12 +1621,14 @@ class Timetable:
                     found += self.plan(o, t, when, count, direct, change, walk_start, groups, walk_end)
         vehicles = lambda j: sum(leg["type"] == "trip" for leg in j["legs"])  # noqa: E731
         found.sort(key=lambda j: (j["departure"], j["arrival"], vehicles(j)))
+        # 1.58.2: one that leaves earlier and arrives at the same time stays (a bus the rider can take, see _earlier_direct).
+        beats = lambda k, j: (k["departure"] >= j["departure"] and vehicles(k) <= vehicles(j)  # noqa: E731
+                              and (k["arrival"] < j["arrival"] or k["arrival"] == j["arrival"] and k["departure"] == j["departure"]))
         kept = []
         for j in found:
-            if any(k["departure"] >= j["departure"] and k["arrival"] <= j["arrival"] and vehicles(k) <= vehicles(j) for k in kept):
+            if any(beats(k, j) for k in kept):
                 continue
-            kept = [k for k in kept if not (j["departure"] >= k["departure"] and j["arrival"] <= k["arrival"]
-                                            and vehicles(j) <= vehicles(k))] + [j]
+            kept = [k for k in kept if not beats(j, k)] + [j]
         return sorted(kept, key=lambda j: j["departure"])[:count]
 
     def plan(self, origin, target, when, count=5, direct=False, change=CHANGE_S, walk_start=True, groups=None, walk_end=True):
@@ -1663,7 +1665,36 @@ class Timetable:
             else:
                 out.append(journey)
             t = (day.conns[legs[0][1]][0] if legs[0][0] == "trip" else legs[0][2]) + 60
-        return out
+        return sorted(out + self._earlier_direct(day, origin, target, when - day.base, out), key=lambda j: j["departure"])
+
+    def _earlier_direct(self, day, origin, target, t0, found):
+        """
+        1.58.2: the search above keeps, per arrival, the bus that leaves last, so a direct bus leaving earlier and
+        getting there just as early was never shown (12 from Zvolen, Nám.SNP 15:50 -> Zlatý Potok 16:05, hidden by the
+        1 at 15:53 -> 16:05). Direct buses leaving before the last found connection come back when they arrive no
+        later than the next found one leaving after them; one per arrival (the one leaving last).
+        """
+        if not found:
+            return []
+        conns, ids = day.conns, day.from_station.get(origin, [])
+        last = found[-1]["departure"] // 1000 - day.base
+        have = {leg["tripId"] for j in found for leg in j["legs"] if leg["type"] == "trip"}
+        by_arrival = {}
+        for i in ids[bisect.bisect_left(ids, bisect.bisect_left(day.deps, t0)):]:
+            dep, _, _, _, run, k = conns[i]
+            if dep >= last:
+                break
+            trip, service_day = self.run_trip(day, run)
+            if f"{trip[0]}:{trip[1]}:{service_day:%Y%m%d}" in have:
+                continue
+            stops = trip[7]
+            kk = next((x for x in range(k + 1, len(stops)) if stops[x] == target), None)
+            j = self._conn_at(day, conns[i], kk - 1) if kk is not None else None
+            nxt = next((f for f in found if f["departure"] // 1000 - day.base >= dep), None)
+            if j is None or nxt is None or conns[j][1] > nxt["arrival"] // 1000 - day.base:
+                continue
+            by_arrival[conns[j][1]] = (i, j)
+        return [self._journey(day, [("trip", i, j)]) for i, j in by_arrival.values()]
 
     def _conn_at(self, day, conn, k):
         """The index in day.conns of the same run's connection from its k-th stop, None when the day doesn't have it."""
