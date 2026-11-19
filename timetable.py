@@ -412,6 +412,9 @@ class Timetable:
         for pid, (name, lat, lon, _, stop_id) in self.city_platforms.items():
             stops.setdefault(stop_id, []).append((pid, name, lat, lon))
         station_of, platforms_of = {}, {}
+        # 1.58.3: a city stop is not the train station beside it ("Železničná stanica" in Banská Bystrica was merged
+        # into ŽSR's "Banská Bystrica" 50 m away, so the map had one point for both).
+        self._trains_only = {s for s in range(len(self.names)) if self.rail_only(s)}
         for members in stops.values():
             name = max({m[1] for m in members}, key=lambda n: sum(m[1] == n for m in members))
             lat = sum(m[2] for m in members) / len(members)
@@ -634,7 +637,7 @@ class Timetable:
             return own and words and (match_score(own, words) is not None or match_score(words, own) is not None)
         near, town = [], None
         for s in range(len(self.names)):
-            if self.lat[s] is None or abs(self.lat[s] - lat) > 0.05 or abs(self.lon[s] - lon) > 0.07:
+            if self.lat[s] is None or abs(self.lat[s] - lat) > 0.05 or abs(self.lon[s] - lon) > 0.07 or s in getattr(self, "_trains_only", ()):
                 continue
             d = meters(lat, lon, self.lat[s], self.lon[s])
             near.append((d, s))
@@ -747,6 +750,14 @@ class Timetable:
             base = " ".join(fold(name))
             for n, (_, _, keys, coords) in enumerate(sorted(clusters, key=lambda c: -len(c[2]))):
                 sid = base if n == 0 else f"{base}~{n}"
+                # Names that differ only in case or accents fold alike: the city stop "Banská Bystrica, Železničná
+                # stanica" and the train station "…, železničná stanica" got one id, and the map lost one of them.
+                extra = len(clusters)
+                while sid in self.by_id:
+                    sid = f"{base}~{extra}"
+                    extra += 1
+                if sid != base and n == 0:
+                    print(f"[timetable] same station id: {name!r} is {sid}", flush=True)
                 index = len(self.names)
                 self.station_ids.append(sid)
                 self.names.append(name)
