@@ -57,7 +57,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.58.3"
+VERSION = "1.58.4"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -2844,7 +2844,8 @@ def timetable_query(route, query):
         except ValueError:
             return 400, {"error": "stops: lat,lon;lat,lon;..."}
         traces = timetable.edits["segments"]
-        near = [[s["id"] for s in t.near(lat, lon, 300, 3)] for lat, lon in stops]
+        # EM-0119: train stations too (near() leaves them out for apps from before trains), so a train follows the railway.
+        near = [[s["id"] for s in t.near(lat, lon, 300, 5, timetable.GROUPS)] for lat, lon in stops]
         return 200, {"hops": [next((traces[f"{x}>{y}"] for x in a for y in b if f"{x}>{y}" in traces), [])
                               for a, b in zip(near, near[1:])]}
     if route == "bus":

@@ -1244,6 +1244,10 @@ pa, pb = tt.by_id["town park"], tt.by_id["town as"]
 timetable.edits["segments"]["town park>town as"] = [[48.71, 19.13]]
 there = hub.timetable_query("path", {"stops": f"{tt.lat[pa]},{tt.lon[pa]};{tt.lat[pb]},{tt.lon[pb]};{tt.lat[pa]},{tt.lon[pa]}"})[1]["hops"]
 assert there == [[[48.71, 19.13]], []], there
+# EM-0119: a train's stations (rail only) are found too, so a train's map follows the railway.
+real_rail_only, tt.rail_only = tt.rail_only, (lambda s: True)
+assert hub.timetable_query("path", {"stops": f"{tt.lat[pa]},{tt.lon[pa]};{tt.lat[pb]},{tt.lon[pb]}"})[1]["hops"] == [[[48.71, 19.13]]]
+tt.rail_only = real_rail_only
 del timetable.edits["segments"]["town park>town as"]
 assert hub.timetable_query("path", {"stops": "48.7,x"})[0] == 400
 
