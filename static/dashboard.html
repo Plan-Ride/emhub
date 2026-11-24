@@ -1211,7 +1211,9 @@ async function renderDemo() {
           <option value="strip"${d.messageStyle === "strip" ? " selected" : ""}>In the top strip, always</option></select>
         <button class="btn primary" type="button" id="demo-show">Show</button><button class="btn" type="button" id="demo-clear">Remove</button></div>
       <p class="muted small" style="margin:6px 0 0">For the phones chosen under Kiosk, lock and the app.</p></details>
-    <details style="margin-bottom:12px"><summary><b>Tour content</b> <span class="muted">${order.length} of ${steps.length} steps</span></summary>
+    <details style="margin-bottom:12px"><summary><b>Tour content</b> <span class="muted">${steps.length ? `${order.length} of ${steps.length} steps` : "waiting for a phone"}</span></summary>
+      ${!steps.length ? `<p class="muted small" style="margin:6px 0">The phones tell emHUB which steps their tour has. None has since emHUB last restarted:
+        open the demo on a phone with the current demo build (an older build doesn't send them) and the steps appear here within a few seconds.</p>` : `
       <p class="muted small" style="margin:6px 0">Tick what the tour shows and set the order. Saving starts the tour again on all phones.</p>
       <ol id="demo-steps" style="margin:0;padding-left:1.6em">
         ${[...order.map((id) => [id, true]), ...unused.map((id) => [id, false])].map(([id, on]) => `<li data-step="${esc(id)}" style="margin:2px 0">
@@ -1219,7 +1221,7 @@ async function renderDemo() {
           <button class="btn small" type="button" data-move="-1" aria-label="Earlier">&uarr;</button><button class="btn small" type="button" data-move="1" aria-label="Later">&darr;</button></li>`).join("")}
       </ol>
       <div class="row" style="gap:8px;margin-top:8px"><button class="btn primary" type="button" id="demo-steps-save">Save tour</button>
-        <button class="btn" type="button" id="demo-steps-all">All, in the app's order</button></div></details>
+        <button class="btn" type="button" id="demo-steps-all">All, in the app's order</button></div>`}</details>
     <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
       <b>Wave</b><label>each phone <input type="number" id="demo-gap" min="100" max="5000" step="100" value="700" style="width:5.5em"> ms after the one before</label>
       <button class="btn" type="button" data-act="wave" title="In the list's order, online phones only">Start wave</button>
@@ -1289,8 +1291,8 @@ async function renderDemo() {
     const li = b.closest("li"), other = +b.dataset.move < 0 ? li.previousElementSibling : li.nextElementSibling;
     if (other) +b.dataset.move < 0 ? other.before(li) : other.after(li);
   });
-  $("#demo-steps-save").onclick = () => send({ action: "steps", steps: [...box.querySelectorAll("#demo-steps li")].filter((li) => li.querySelector("input").checked).map((li) => li.dataset.step) });
-  $("#demo-steps-all").onclick = () => send({ action: "steps", steps: [] });
+  if ($("#demo-steps-save")) $("#demo-steps-save").onclick = () => send({ action: "steps", steps: [...box.querySelectorAll("#demo-steps li")].filter((li) => li.querySelector("input").checked).map((li) => li.dataset.step) });
+  if ($("#demo-steps-all")) $("#demo-steps-all").onclick = () => send({ action: "steps", steps: [] });
   // Every 5 s, but not while something here is being typed or chosen, or a part is open.
   clearTimeout(renderDemo.t);
   const busy = () => box.contains(document.activeElement) || box.querySelector("details[open]") || $("#demo-apk")?.files.length;

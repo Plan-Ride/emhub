@@ -58,12 +58,20 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.62.0"
+VERSION = "1.62.1"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
 PUBLIC_URL = ENV("HUB_PUBLIC_URL", "http://localhost:8080").rstrip("/")
 # Older hostnames the dashboard may still be opened on (e.g. after a domain move), comma-separated.
+# The Android app's signing certificates (SHA-256), as in the web server (App Links): Play Console's three and the
+# team computer's build key.
+APP_CERTS = [
+    "F3:FD:B9:E8:A6:22:ED:94:6E:66:08:55:B1:3E:E6:D3:1E:87:5B:EE:C3:2B:04:58:A0:1B:F9:E7:10:98:AC:6B",
+    "F7:31:02:25:C5:6F:3C:CA:D3:67:11:EC:3C:6B:2C:CF:79:7F:25:B2:97:4F:3C:01:4D:E4:1F:38:00:9F:5A:FA",
+    "8B:D4:13:A3:90:62:0C:E7:68:72:4C:29:17:A6:73:71:F8:E8:9F:5A:88:F9:C8:E1:C9:4A:8C:46:AE:7C:3F:5D",
+    "1F:28:6B:2E:70:27:60:C2:23:62:70:85:85:40:38:5A:01:2D:8E:80:CD:34:BF:7E:35:CE:EF:90:E2:D1:DA:F2",
+]
 ORIGINS = {PUBLIC_URL} | {o.strip().rstrip("/") for o in ENV("HUB_EXTRA_ORIGINS", "").split(",") if o.strip()}
 DB_PATH = ENV("HUB_DB", str(HERE / "hub.db"))
 APP_KEYS = {k.strip() for k in ENV("HUB_APP_KEYS", "dev-key").split(",") if k.strip()}
@@ -2572,7 +2580,7 @@ def render_site(name, lang, content=None):
         "lang_switch": f'<a href="{site_url(name, other)}" hreflang="{other}" lang="{other}">{words["other"]}</a>',
         "admin_label": words["admin"], "year": datetime.now(LOCAL_ZONE).year,
         "sources_url": site_url("sources", lang), "sources_label": SITE_PAGES["sources"][1][lang][0],
-        "content": (site_source(name, lang) if content is None else content).replace("%WEB_URL%", html.escape(setting("web_url") or "https://testem.karafa.net")),
+        "content": (site_source(name, lang) if content is None else content).replace("%WEB_URL%", html.escape(setting("web_url") or "https://app.par.karafa.net")),
     }
     return render_template("", values, (HERE / "site" / "layout.html").read_text(encoding="utf-8"))
 
@@ -3355,6 +3363,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, sitemap_xml(), "application/xml")
         if method == "GET" and path.startswith("/eta/"):
             return self.send(200, eta_page(etas.get(path[len("/eta/"):])), "text/html")
+        if method == "GET" and path == "/.well-known/assetlinks.json":
+            # Links shared before 2.18.5 (par.karafa.net/f) open the Android app too (App Links); the web server has the same.
+            return self.send(200, [{"relation": ["delegate_permission/common.handle_all_urls"],
+                                    "target": {"namespace": "android_app", "package_name": "com.ksjd.testem",
+                                               "sha256_cert_fingerprints": APP_CERTS}}])
         if method == "GET" and path == "/f":
             # A followed bus shared from the app: the web version opens it (the app's link stays the same if it moves).
             trip = query.get("t", "")
