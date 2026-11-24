@@ -130,6 +130,10 @@ def collect(folder):
     # Asked soon after midnight, sadzv still lists yesterday's trips (30 Oct: read at 00:28, every city bus of the day
     # was Thursday's, none ran on Friday). Those are dropped; mostly yesterday's means sadzv hasn't turned the day yet.
     count = len(trips)
+    if not count:
+        # 24 Nov: sadzv moved to m.mhdbb.qrbus.me and its old API answers every platform with no trips. Saved, that empty
+        # day hid every city bus; unsaved, the timetable reuses the last day of the same kind.
+        raise RuntimeError("sadzv: no city bus trips on any platform, today's city timetable not saved")
     trips = {k: t for k, t in trips.items() if min(s for _, s in t["stops"]) >= 0}
     if len(trips) < count / 2:
         raise RuntimeError(f"sadzv: {count - len(trips)} of {count} trips are yesterday's, today's city timetable not saved")

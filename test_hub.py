@@ -353,7 +353,8 @@ sitemap = call("/sitemap.xml")[2].decode()
 for name in hub.SITE_PAGES:
     for lang in hub.SITE_LANGS:
         url = hub.PUBLIC_URL + hub.site_url(name, lang)
-        assert f"<loc>{url}</loc>" in sitemap
+        # The open day page is only for the demo phones' QR code: not in the sitemap.
+        assert (f"<loc>{url}</loc>" in sitemap) == (name != "openday")
         assert call(hub.site_url(name, lang))[0] == 200
         assert f'<link rel="canonical" href="{url}">' in call(hub.site_url(name, lang))[2].decode()
 assert f'rel="canonical" href="{hub.PUBLIC_URL}/en/"' in call("/en")[2].decode()
@@ -449,7 +450,7 @@ assert ws_open.__name__ and call("/api/v1/shares/live?side=owner&id=x&token=y")[
 owner.close(); other.close()
 assert call("/admin/api/site")[0] == 401, "editing needs a signed-in admin"
 pages = json.loads(call("/admin/api/site", cookie=cookie)[2])
-assert len(pages) == 10 and not any(p["custom"] for p in pages)
+assert len(pages) == 12 and not any(p["custom"] for p in pages)
 assert b"Draft" in json.loads(call("/admin/api/site/support/en/preview", {"html": "<h1>Draft</h1>"}, cookie)[2])["html"].encode()
 assert b"Draft" not in call("/en/support")[2], "a preview is not published"
 assert call("/admin/api/site/support/en/save", {"html": "<h1>New support</h1>"}, cookie)[0] == 200
@@ -1544,3 +1545,18 @@ assert [v["Vin"] for v in snap["vehicles"]] == [1, 1], snap
 assert not any("river" in k or "Dut" in k for v in snap["vehicles"] for k in v), snap["vehicles"][0]
 assert snap["cities"][0]["total"] == 2 and snap["cities"][0]["live"] == 1 and snap["cities"][0]["counted"] == 1 and "error" in snap["cities"][2], snap["cities"]
 print("ok fleet")
+
+# 1.62.0: a bug report's video: where it was filmed is blanked in place (the boxes keep their size), damage is refused.
+def box(kind, body):
+    return (8 + len(body)).to_bytes(4, "big") + kind + body
+place = box(b"\xa9xyz", b"+48.7350+019.1450/")
+movie = box(b"ftyp", b"qt  \0\0\0\0qt  ") + box(b"moov", box(b"mvhd", b"\0" * 20) + box(b"udta", place) + box(b"trak", box(b"meta", b"loc"))) + box(b"mdat", b"frames")
+mime, clean = hub.clean_video(movie)
+assert mime == "video/quicktime" and len(clean) == len(movie) and b"+48.73" not in clean and b"loc" not in clean and clean.endswith(box(b"mdat", b"frames"))
+for bad in (movie + b"<html>", movie[:-3], b"\0\0\0\x10mdat" + b"x" * 8):
+    try:
+        hub.clean_video(bad)
+        raise AssertionError("a damaged video was taken")
+    except ValueError:
+        pass
+print("ok bug video")

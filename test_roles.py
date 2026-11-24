@@ -75,7 +75,7 @@ R = [
     ("POST", "map/segment", "map"), ("POST", "map/segment/reset", "map"), ("POST", "map/via", "map"), ("POST", "map/route", "map"), ("POST", "map/way", "map"), ("POST", "map/snap", "map"),
     ("POST", "map/bulk", "map"), ("POST", "map/history/1/undo", "map"), ("POST", "stops/new", "map"),
     ("GET", "fleet", "fleet"), ("GET", "site", "site"), ("GET", "site/home/sk", "site"), ("POST", "site/home/sk/preview", "site"), ("POST", "site/home/sk/save", "site"), ("POST", "site/home/sk/reset", "site"),
-    ("GET", "server", "server"), ("POST", "server/backup", "server"),
+    ("GET", "server", "server"), ("POST", "server/backup", "server"), ("GET", "demo", "server"), ("POST", "demo", "server"), ("POST", "demo/apk", "server"),
     ("GET", "mailbox/folders", "mail"), ("GET", "mailbox/list?folder=INBOX", "mail"), ("GET", "mailbox/message?uid=1", "mail"),
     ("GET", "mailbox/attachment?uid=1&n=0", "mail"), ("POST", "mailbox/send", "mail"), ("POST", "mailbox/move", "mail"), ("POST", "mailbox/draft", "mail"),
     ("GET", "audit", None), ("GET", "admins", None), ("POST", "admins", None), (f"POST", f"admins/{admin_id}/remove", None), ("POST", f"admins/{admin_id}/resend", None), ("POST", f"admins/{admin_id}/access", None),

@@ -15,6 +15,7 @@ Configuration comes from environment variables (see hub.env.example).
 """
 from concurrent.futures import ThreadPoolExecutor
 import base64
+import binascii
 import hashlib
 import hmac
 import html
@@ -57,7 +58,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.58.4"
+VERSION = "1.62.0"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -815,7 +816,8 @@ def record_build(t):
     with db() as conn:
         for feed, trips in t.feeds.items():
             result = (timetable.downloads.get(feed) or {}).get("result", "")
-            failed = trips == "failed"
+            # Today's city buses not read (sadzv empty, 24 Nov): earlier days stand in, so the count alone never shows it.
+            failed = trips == "failed" or result.startswith("not read")
             prev = conn.execute("SELECT trips FROM feed_history WHERE feed=? AND day<? AND trips IS NOT NULL ORDER BY day DESC LIMIT 1",
                                 (feed, day)).fetchone()
             dropped = not failed and prev and prev["trips"] >= 20 and trips < 0.7 * prev["trips"]
@@ -824,7 +826,8 @@ def record_build(t):
                             ON CONFLICT(day, feed) DO UPDATE SET trips=excluded.trips, result=excluded.result""",
                          (day, feed, None if failed else trips, result[:200]))
             if (failed or dropped) and not (row and row["alerted"]):
-                alerts.append(f"{feed}: " + ("could not be read" if failed else f"{trips} trips, was {prev['trips']}"))
+                alerts.append(f"{feed}: " + (f"could not be read ({result})" if result.startswith("not read") else "could not be read" if failed
+                                             else f"{trips} trips, was {prev['trips']}"))
                 conn.execute("UPDATE feed_history SET alerted=1 WHERE day=? AND feed=?", (day, feed))
         summary = build_summary(t)
         last = conn.execute("SELECT data FROM build_snapshots ORDER BY built DESC LIMIT 1").fetchone()
@@ -1309,6 +1312,164 @@ def snap_one(a, b, pause, via=()):
     if best[1] > sum(timetable.meters(p[0], p[1], q[0], q[1]) for p, q in zip(chain, chain[1:])) * 3 + 1000:
         return None
     return best
+
+
+# ------------------------------------------------------------------ open day demo phones (the app's demo build)
+
+# One clock for every demo phone: each works out where in the tour it is from the tour's start ("epoch"), so the phones
+# nobody is touching show the same thing at the same time. The dashboard's Server tab sets what they show, for all of
+# them, a group or one: the tour ("tour"), one step held on screen ("hold", e.g. the Google Play code) or no tour ("off");
+# a message, which steps the tour has, a wave across the table, blinking a phone. 1.61.0: groups, the kiosk (the app as
+# the device owner: no home, recents or status bar) and the touch lock, a PIN to unlock a phone on the spot, the app
+# updated or removed from here, where visitors picked a phone up and which tabs they opened, QR code scans.
+DEMO_FILE = Path(DB_PATH).parent / "demo.json"
+DEMO_APK = Path(DB_PATH).parent / "demo.apk"
+DEMO_MODES = ("tour", "hold", "off")
+DEMO_OWN = ("mode", "hold", "message", "kiosk", "locked")   # what a phone or group may have of its own
+_demo_devices = {}   # device id -> what it last said (in memory: a restart forgets them until they connect again)
+_demo_sockets = {}   # device id -> its open WebSocket (/api/v1/demo/live), so the dashboard's orders arrive at once
+_demo_visits = {}    # device id -> when a visitor picked it up (seconds), while they use it
+_demo_screens = {}   # device id -> the tab its visitor is on (a new one counts as a tab opened)
+_demo_facts = [0, {}]  # (when, facts) for the tour's map and counter slides, a minute old at most
+_demo_lock = threading.Lock()
+_demo_file_lock = threading.Lock()
+
+
+def demo_saved():
+    try:
+        saved = json.loads(DEMO_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved.setdefault("epoch", 0)
+    saved.setdefault("mode", "tour")
+    saved.setdefault("hold", "")
+    saved.setdefault("idleSeconds", 60)
+    saved.setdefault("resetAt", 0)
+    saved.setdefault("message", {"text": "", "style": "slide"})
+    saved.setdefault("steps", [])    # the tour's steps in order ([] = the app's own)
+    saved.setdefault("kiosk", False)  # the app holds the screen (device owner's lock task)
+    saved.setdefault("locked", False)  # touches do nothing: the phones show only what the dashboard says
+    saved.setdefault("lockAt", 0)    # when kiosk or lock was last turned on: a phone unlocked with the PIN before it locks again
+    saved.setdefault("pin", "")      # unlocks a phone on the spot (five taps in the top left corner)
+    saved.setdefault("apk", {})      # {"sha256", "size", "version", "at"}: the uploaded demo build
+    saved.setdefault("devices", {})  # id -> {"name", "group", "mode", "hold", "message", "kiosk", "locked", "resetAt", "offsetMs", "updateAt", "removeAt"}
+    saved.setdefault("visits", {})   # "YYYY-MM-DD" -> {id: [visits, seconds]}
+    saved.setdefault("stats", {})    # "YYYY-MM-DD" -> {"steps": {step: n}, "tabs": {tab: n}, "qr": n}
+    return saved
+
+
+def demo_write(change):
+    """Read, change and save demo.json in one go (the dashboard and the phones' visit counts both write it)."""
+    with _demo_file_lock:
+        saved = demo_saved()
+        if not saved["pin"]:
+            saved["pin"] = f"{secrets.randbelow(10 ** 6):06d}"
+        change(saved)
+        for key in ("visits", "stats"):
+            for old in sorted(saved[key])[:-30]:
+                del saved[key][old]
+        tmp = DEMO_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(DEMO_FILE)
+        return saved
+
+
+def demo_facts():
+    """Numbers for the tour: carriers, stops and today's journey searches (a minute old at most)."""
+    if time.time() - _demo_facts[0] > 60:
+        t = timetable.current
+        with db() as conn:
+            row = conn.execute("SELECT SUM(n) n FROM search_stats WHERE kind='route' AND day=?",
+                               (datetime.now(timetable.ZONE).date().isoformat(),)).fetchone()
+        _demo_facts[:] = [time.time(), {"operators": len({trip[4] for trip in t.trips}) if t else 0,
+                                        "stops": len(t.names) if t else 0, "searchesToday": int(row["n"] or 0)}]
+    return _demo_facts[1]
+
+
+def demo_for(saved, device):
+    """What one phone does: its own choices where it has them, else everyone's."""
+    own = saved["devices"].get(device, {})
+    message = own.get("message") if own.get("message", {}).get("text") else saved["message"]
+    pick = lambda key: own[key] if key in own else saved[key]  # noqa: E731
+    return {"now": int(time.time() * 1000), "epoch": saved["epoch"], "mode": own.get("mode") or saved["mode"],
+            "hold": own.get("hold") if own.get("mode") else saved["hold"], "idleSeconds": saved["idleSeconds"],
+            "resetAt": max(saved["resetAt"], own.get("resetAt", 0)), "name": own.get("name", ""), "group": own.get("group", ""),
+            "message": message.get("text", ""), "messageStyle": message.get("style", "slide"),
+            "steps": saved["steps"], "offsetMs": int(own.get("offsetMs", 0)),
+            "kiosk": bool(pick("kiosk")), "locked": bool(pick("locked")), "lockAt": max(saved["lockAt"], own.get("lockAt", 0)),
+            "pinHash": hashlib.sha256(saved["pin"].encode()).hexdigest() if saved["pin"] else "",
+            "apkSha": saved["apk"].get("sha256", ""), "updateAt": own.get("updateAt", 0), "removeAt": own.get("removeAt", 0),
+            "facts": demo_facts()}
+
+
+def demo_record(device, data):
+    """What a phone says it shows now; a visitor picking it up or putting it down counts as a visit, a new tab as a tab opened."""
+    steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+    visitor = bool(data.get("visitor"))
+    battery = data.get("battery")
+    screen = clean(data.get("screen"), 40)
+    with _demo_lock:
+        if device not in _demo_devices and len(_demo_devices) >= 50:
+            return
+        _demo_devices[device] = {"id": device, "model": clean(data.get("model"), 60), "version": clean(data.get("version"), 30),
+                                 "touring": bool(data.get("touring")), "visitor": visitor, "step": clean(data.get("step"), 60),
+                                 "screen": screen, "seen": now(),
+                                 "battery": battery if isinstance(battery, int) and 0 <= battery <= 100 else None,
+                                 "charging": bool(data.get("charging")),
+                                 "owner": bool(data.get("owner")), "kioskOn": bool(data.get("kioskOn")),
+                                 "lockOn": bool(data.get("lockOn")), "unlocked": bool(data.get("unlocked")),
+                                 "apkSha": clean(data.get("apkSha"), 64), "updating": clean(data.get("updating"), 80),
+                                 "steps": [[clean(x[0], 30), clean(x[1], 60)] for x in steps[:40] if isinstance(x, list) and len(x) == 2]}
+        started = _demo_visits.get(device)
+        tab = screen if visitor and screen and _demo_screens.get(device) != screen else None
+        if visitor:
+            _demo_screens[device] = screen
+        else:
+            _demo_screens.pop(device, None)
+        if visitor and started is None:
+            _demo_visits[device] = now()
+            change = "start"
+        elif not visitor and started is not None:
+            del _demo_visits[device]
+            change = "end"
+        else:
+            change = None
+        if change is None and tab is None:
+            return
+    day = datetime.now(LOCAL_ZONE).date().isoformat()
+    picked_at = clean(data.get("fromStep"), 60)
+
+    def count(saved):
+        stats = saved["stats"].setdefault(day, {})
+        if change:
+            row = saved["visits"].setdefault(day, {}).setdefault(device, [0, 0])
+            if change == "start":
+                row[0] += 1
+                if picked_at:
+                    stats.setdefault("steps", {})[picked_at] = stats.get("steps", {}).get(picked_at, 0) + 1
+            else:
+                row[1] += now() - started
+        if tab:
+            stats.setdefault("tabs", {})[tab] = stats.get("tabs", {}).get(tab, 0) + 1
+    demo_write(count)
+
+
+def demo_push(devices=None, extra=None):
+    """The phones (all, or these) told at once what to show now; [extra] instead for a one-off order (blink)."""
+    saved = demo_saved()
+    with _demo_lock:
+        targets = [(d, ws) for d, ws in _demo_sockets.items() if devices is None or d in devices]
+    for d, ws in targets:
+        try:
+            ws.send_json(extra or dict(demo_for(saved, d), type="control"))
+        except OSError:
+            pass
+
+
+def demo_qr_scan():
+    """The open day page opened from the phones' QR code."""
+    day = datetime.now(LOCAL_ZONE).date().isoformat()
+    demo_write(lambda saved: saved["stats"].setdefault(day, {}).update(qr=saved["stats"].get(day, {}).get("qr", 0) + 1))
 
 
 # ------------------------------------------------------------------ settings
@@ -2168,6 +2329,69 @@ def clean_jpeg(blob):
     return b"".join(out)
 
 
+MAX_VIDEO_BYTES = 50_000_000
+VIDEO_DIR = Path(DB_PATH).parent / "bug-videos"
+# Boxes that hold a recording's details, not its picture or sound: the place it was taken (an iPhone's ©xyz and
+# com.apple.quicktime.location.ISO6709), the phone, the time, an XMP packet.
+VIDEO_DETAILS = {b"udta", b"meta", b"uuid", b"XMP_"}
+VIDEO_CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts"}
+
+
+def clean_video(blob):
+    """
+    An MP4 or QuickTime video from a bug report, or ValueError. Every box must be whole and the boxes must fill the file
+    (nothing smuggled after them). Boxes with the recording's details (where it was filmed above all) become "free"
+    boxes of the same size, zeroed: nothing moves, so the offsets into the picture data stay right without re-encoding.
+    Returns (mime, cleaned bytes).
+    """
+    data = bytearray(blob)
+
+    def walk(start, end, depth):
+        i = start
+        while i < end:
+            if i + 8 > end:
+                raise ValueError("The video is damaged")
+            size, kind, head = int.from_bytes(data[i:i + 4], "big"), bytes(data[i + 4:i + 8]), 8
+            if size == 1:
+                if i + 16 > end:
+                    raise ValueError("The video is damaged")
+                size, head = int.from_bytes(data[i + 8:i + 16], "big"), 16
+            elif size == 0 and depth == 0:
+                size = end - i
+            if size < head or i + size > end:
+                raise ValueError("The video is damaged")
+            if kind in VIDEO_DETAILS:
+                data[i + 4:i + 8] = b"free"
+                data[i + head:i + size] = bytes(size - head)
+            elif kind in VIDEO_CONTAINERS and depth < 8:
+                walk(i + head, i + size, depth + 1)
+            i += size
+
+    if len(data) < 16 or bytes(data[4:8]) != b"ftyp":
+        raise ValueError("Only MP4 or MOV videos")
+    brand = bytes(data[8:12])
+    walk(0, len(data), 0)
+    return ("video/quicktime" if brand == b"qt  " else "video/mp4"), bytes(data)
+
+
+def bug_video(value):
+    """One video with a bug report (base64, at most 50 MB): (mime, cleaned bytes) or None."""
+    if not value:
+        return None
+    try:
+        blob = base64.b64decode(str(value), validate=True)
+    except ValueError:
+        raise ValueError("The video could not be read") from None
+    if len(blob) > MAX_VIDEO_BYTES:
+        raise ValueError("The video is too large (max 50 MB)")
+    return clean_video(blob)
+
+
+def video_of(bug_id):
+    """The report's video file, or None."""
+    return next((f for f in (VIDEO_DIR / f"{bug_id}.mp4", VIDEO_DIR / f"{bug_id}.mov") if f.exists()), None)
+
+
 def bug_images(values):
     """Screenshots or photos sent with a bug report: base64 JPEG (the apps re-encode whatever the user picks),
     at most 5 of 4 MB each. Only JPEG: one format to check, and nothing a browser could run as a script."""
@@ -2276,13 +2500,18 @@ SITE_PAGES = {
         "sk": ("Súkromie", "Zásady ochrany súkromia Plan&Ride", "Čo aplikácia Plan&Ride posiela kam a vaše práva."),
         "en": ("Privacy", "Plan&Ride privacy policy", "What the Plan&Ride app sends where, and your rights."),
     }),
+    # 1.61.0: the open day phones' QR code (not in the menu or the footer).
+    "openday": ("den", {
+        "sk": ("Deň otvorených dverí", "Plan&Ride: ďakujeme, že ste si ho vyskúšali", "Stiahnite si Plan&Ride do Androidu alebo ho otvorte na iPhone."),
+        "en": ("Open day", "Plan&Ride: thanks for trying it", "Get Plan&Ride on Android or open it on an iPhone."),
+    }),
     # 1.55.0: linked from the footer only, not the main menu.
     "sources": ("sources", {
         "sk": ("Zdroje údajov", "Zdroje údajov Plan&Ride", "Otvorené údaje, ktoré Plan&Ride používa, a ich licencie."),
         "en": ("Data sources", "Plan&Ride data sources", "The open data Plan&Ride uses, and their licences."),
     }),
 }
-SITE_FOOTER_ONLY = ("sources",)
+SITE_FOOTER_ONLY = ("sources", "openday")
 SITE_LANGS = ("sk", "en")
 NOINDEX = {"X-Robots-Tag": "noindex"}
 SITE_WORDS = {"sk": {"nav": "Hlavná ponuka", "admin": "Správa", "other": "English"},
@@ -2301,7 +2530,7 @@ def robots_txt():
 
 
 def sitemap_xml():
-    urls = "".join(f"<url><loc>{PUBLIC_URL}{site_url(name, lang)}</loc></url>" for name in SITE_PAGES for lang in SITE_LANGS)
+    urls = "".join(f"<url><loc>{PUBLIC_URL}{site_url(name, lang)}</loc></url>" for name in SITE_PAGES if name != "openday" for lang in SITE_LANGS)
     return f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>'
 
 
@@ -2343,7 +2572,7 @@ def render_site(name, lang, content=None):
         "lang_switch": f'<a href="{site_url(name, other)}" hreflang="{other}" lang="{other}">{words["other"]}</a>',
         "admin_label": words["admin"], "year": datetime.now(LOCAL_ZONE).year,
         "sources_url": site_url("sources", lang), "sources_label": SITE_PAGES["sources"][1][lang][0],
-        "content": site_source(name, lang) if content is None else content,
+        "content": (site_source(name, lang) if content is None else content).replace("%WEB_URL%", html.escape(setting("web_url") or "https://testem.karafa.net")),
     }
     return render_template("", values, (HERE / "site" / "layout.html").read_text(encoding="utf-8"))
 
@@ -2961,7 +3190,8 @@ class Handler(BaseHTTPRequestHandler):
     def error(self, status, message, cors=False):
         self.send(status, {"error": message}, headers=self.cors() if cors else None)
 
-    MAX_BODY = 20_000_000  # a bug report may carry a few photos
+    MAX_BODY = 20_000_000
+    MAX_BODY_BUGS = 90_000_000  # a bug report may carry a few photos and a video (50 MB, base64)
 
     def read_body(self, limit=1_000_000):
         """The body dispatch() already read (every request's body is always consumed)."""
@@ -3052,7 +3282,7 @@ class Handler(BaseHTTPRequestHandler):
         # Read the whole body up front, even when a handler ignores it: on a keep-alive
         # connection unread bytes would become the start of the next request ("{}GET").
         length = int(self.headers.get("Content-Length") or 0)
-        if length > self.MAX_BODY:
+        if length > (self.MAX_BODY_BUGS if path == "/api/v1/bugs" else self.MAX_BODY):
             self.close_connection = True
             return self.error(413, "Request too large", cors=path.startswith("/api/"))
         self._raw = self.rfile.read(length) if length > 0 else b""
@@ -3115,6 +3345,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def pages(self, method, path, query):
         page = site_route(path)
+        if method == "GET" and page and page[0] == "openday" and query.get("z") == "qr":
+            demo_qr_scan()
         if method == "GET" and page:
             return self.send(200, render_site(*page), "text/html")
         if method == "GET" and path == "/robots.txt":
@@ -3364,9 +3596,43 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, fare_table(), headers=self.cors())
         if method == "POST" and route == "submissions":
             return self.submit_submission()
+        if method == "GET" and route == "demo/apk":
+            # The demo build uploaded in the dashboard (Server tab, Demo phones): the phones install it when told to.
+            if not DEMO_APK.exists():
+                return self.error(404, "No demo build uploaded")
+            return self.send(200, DEMO_APK.read_bytes(), "application/vnd.android.package-archive")
+        if method == "GET" and route == "demo/live":
+            return self.demo_socket(query)
         if route.startswith("eta"):
             return self.eta_api(method, route, query)
         self.error(404, "Not found", cors=True)
+
+    def demo_socket(self, query):
+        """
+        A demo phone's live line: GET /api/v1/demo/live?id=<device> as a WebSocket (with the app key). The server sends
+        {"type": "control"} (what to show, the tour clock, kiosk and lock, update) at once and whenever the dashboard
+        changes it; the phone sends {"type": "state", ...} when it changes and every 5 s, answered with the clock.
+        """
+        device = clean(query.get("id"), 64)
+        if not device or "websocket" not in (self.headers.get("Upgrade") or "").lower() or not self.headers.get("Sec-WebSocket-Key"):
+            return self.error(400, "id and a WebSocket request are required", cors=True)
+        ws = WebSocket.accept(self)
+        with _demo_lock:
+            _demo_sockets[device] = ws
+        try:
+            ws.send_json(dict(demo_for(demo_saved(), device), type="control"))
+            for message in ws.messages():
+                if message.get("type") == "state":
+                    demo_record(device, message)
+                    # "t": the phone's own send time back, so it knows how long the way there and back took (its clock).
+                    ws.send_json(dict(demo_for(demo_saved(), device), type="control", t=message.get("t")))
+        finally:
+            with _demo_lock:
+                if _demo_sockets.get(device) is ws:
+                    del _demo_sockets[device]
+            if _demo_visits.get(device) is not None:  # gone mid-visit: the visit ends now
+                demo_record(device, dict(_demo_devices.get(device, {}), visitor=False))
+            self.close_connection = True
 
     def share_socket(self, query):
         """
@@ -3494,7 +3760,7 @@ class Handler(BaseHTTPRequestHandler):
     def submit_bug(self):
         if not bug_limiter.allow(self.client_ip()):
             return self.error(429, "Too many reports, try again later", cors=True)
-        data = self.json_body(limit=18_000_000)
+        data = self.json_body(limit=90_000_000)  # photos, and a video (base64) since 1.62.0
         if data.get("consent") is not True:
             return self.error(400, "Consent is required", cors=True)
         kind = data.get("kind") if data.get("kind") in BUG_KINDS else "bug"
@@ -3513,6 +3779,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(400, "Email address looks wrong", cors=True)
         category = "feature" if kind == "feature" else data.get("category") if data.get("category") in BUG_CATEGORIES else "other"
         images = bug_images(data.get("images"))
+        video = bug_video(data.get("video"))
         t = now()
         with db() as conn:
             cur = conn.execute(
@@ -3528,8 +3795,13 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute(
                 "INSERT INTO bug_messages(bug_id, created_at, kind, author, body) VALUES (?,?,?,?,?)",
                 (bug["id"], t, "system", "", "Report received" + (f" with {len(images)} image(s)" if images else "")
+                 + (" and a video" if video and images else " with a video" if video else "")
                  + (", confirmation sent to reporter" if email else "")),
             )
+        if video:
+            # On disk, not in the database (its daily backups stay small).
+            VIDEO_DIR.mkdir(exist_ok=True)
+            (VIDEO_DIR / f'{bug["id"]}.{"mov" if video[0] == "video/quicktime" else "mp4"}').write_bytes(video[1])
         code = bug_code(bug["id"])
         admin_to = staff_mail("ideas" if kind == "feature" else "bugs")
         what = "New suggestion" if kind == "feature" else "New bug"
@@ -3709,7 +3981,7 @@ class Handler(BaseHTTPRequestHandler):
             return ("mail",)
         tab = {"timetable": "timetable", "feeds": "timetable", "map": "map", "stops": "map", "lines": "lines", "links": "lines",
                "submissions": "submissions", "releases": "releases", "notices": "notices", "community": "community",
-               "site": "site", "server": "server"}.get(top)
+               "site": "site", "server": "server", "demo": "server"}.get(top)
         return (tab,) if tab else None
 
     def bug_tab(self, bug_id):
@@ -3980,6 +4252,124 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, fleet.snapshot(full="map" not in query))
         if method == "GET" and route == "server":
             return self.send(200, server_health())
+        if method == "GET" and route == "demo":
+            saved = demo_saved()
+            day = datetime.now(LOCAL_ZONE).date().isoformat()
+            today = saved["visits"].get(day, {})
+            with _demo_lock:
+                devices = []
+                for d in _demo_devices.values():
+                    shown = demo_for(saved, d["id"])
+                    own = saved["devices"].get(d["id"], {})
+                    visits, seconds = today.get(d["id"], [0, 0])
+                    if d["id"] in _demo_visits:
+                        seconds += now() - _demo_visits[d["id"]]
+                    devices.append(dict(d, mode=shown["mode"], hold=shown["hold"], name=shown["name"], group=shown["group"],
+                                        own=own.get("mode", ""), message=own.get("message", {}).get("text", ""),
+                                        offsetMs=shown["offsetMs"], kiosk=shown["kiosk"], locked=shown["locked"],
+                                        current=not saved["apk"] or d.get("apkSha") == saved["apk"].get("sha256"),
+                                        online=d["id"] in _demo_sockets, visits=visits, visitSeconds=seconds))
+            devices.sort(key=lambda d: (d["group"], d["name"] or d["model"], d["id"]))
+            return self.send(200, dict(demo_for(saved, ""), mode=saved["mode"], hold=saved["hold"], devices=devices, pin=saved["pin"],
+                                       apk=saved["apk"], kiosk=saved["kiosk"], locked=saved["locked"],
+                                       groups=sorted({v.get("group") for v in saved["devices"].values() if v.get("group")}),
+                                       stats=saved["stats"].get(day, {}),
+                                       visits=sum(v[0] for v in today.values()), visitSeconds=sum(v[1] for v in today.values())))
+        if method == "POST" and route == "demo/apk":
+            # The demo build, base64 in JSON (the admin API takes JSON only); ~5 MB.
+            try:
+                apk = base64.b64decode(self.json_body(limit=40_000_000).get("apk") or "", validate=True)
+            except (ValueError, binascii.Error):
+                return self.error(400, "Not a base64 APK")
+            if len(apk) < 1000 or apk[:2] != b"PK":
+                return self.error(400, "Not an APK")
+            tmp = DEMO_APK.with_suffix(".tmp")
+            tmp.write_bytes(apk)
+            tmp.replace(DEMO_APK)
+            sha = hashlib.sha256(apk).hexdigest()
+            demo_write(lambda saved: saved.update(apk={"sha256": sha, "size": len(apk), "at": now(), "by": user["username"]}))
+            audit(user["username"], f"demo phones: build uploaded {sha[:12]} ({len(apk)} bytes)")
+            demo_push()
+            return self.send(200, {"ok": True, "sha256": sha})
+        if method == "POST" and route == "demo":
+            # For all phones, a group ("group") or one ("device"): mode tour/hold/off ("" = follow all), restart, reset, idle,
+            # name, group, message, steps (the tour's order), wave/line, blink, kiosk and lock (on/off), pin, update, remove.
+            data, at = self.json_body(), int(time.time() * 1000)
+            device, group, action = clean(data.get("device"), 64), clean(data.get("group"), 40), data.get("action")
+            if action == "blink" and device:
+                demo_push([device], {"type": "blink"})
+                return self.send(200, {"ok": True})
+            if action == "wave":
+                gap = max(100, min(5000, int(data.get("gapMs") or 700)))
+                with _demo_lock:
+                    order = [d["id"] for d in _demo_devices.values() if d["id"] in _demo_sockets]
+            elif action == "line":
+                order = []
+            error = None
+            pushed = None  # the phones to tell (None: all)
+
+            def change(saved):
+                nonlocal error, pushed
+                # The phones this is for: one, a group's, or (None) all of them.
+                ids = [device] if device else [d for d, v in saved["devices"].items() if v.get("group") == group] if group else None
+                pushed = ids
+                targets = [saved["devices"].setdefault(d, {}) for d in ids] if ids is not None else [saved]
+                on = bool(data.get("on"))
+                for target in targets:
+                    if action == "mode" and (data.get("mode") in DEMO_MODES or (ids is not None and data.get("mode") == "")):
+                        target["mode"] = data["mode"]
+                        target["hold"] = clean(data.get("hold"), 30)
+                    elif action in ("kiosk", "locked"):
+                        target[action] = on
+                        if on:
+                            target["lockAt"] = at
+                    elif action == "follow" and ids is not None:  # back to what all phones do
+                        for key in DEMO_OWN:
+                            target.pop(key, None)
+                    elif action == "reset":
+                        target["resetAt"] = at
+                    elif action == "message":
+                        target["message"] = {"text": clean(data.get("text"), 300), "style": "strip" if data.get("style") == "strip" else "slide"}
+                    elif action == "update" and ids is not None and saved["apk"]:
+                        target["updateAt"] = at
+                    elif action == "remove" and ids is not None:
+                        target["removeAt"] = at
+                    elif action == "name" and device:
+                        target["name"] = clean(data.get("name"), 40)
+                    elif action == "setgroup" and device:
+                        target["group"] = clean(data.get("name"), 40)
+                    elif ids is None and action == "restart":
+                        saved["epoch"] = at
+                    elif ids is None and action == "idle":
+                        saved["idleSeconds"] = max(15, min(600, int(data.get("idleSeconds") or 60)))
+                    elif ids is None and action == "pin" and re.fullmatch(r"\d{4,8}", str(data.get("pin") or "")):
+                        saved["pin"] = str(data["pin"])
+                    elif ids is None and action == "steps" and isinstance(data.get("steps"), list):
+                        saved["steps"] = [clean(x, 30) for x in data["steps"][:40] if isinstance(x, str)]
+                        saved["epoch"] = at
+                    elif ids is None and action in ("wave", "line"):
+                        named = lambda d: (saved["devices"].get(d, {}).get("name") or _demo_devices.get(d, {}).get("model", ""), d)  # noqa: E731
+                        for other in saved["devices"].values():
+                            other.pop("offsetMs", None)
+                        for i, d in enumerate(sorted(order, key=named)):
+                            saved["devices"].setdefault(d, {})["offsetMs"] = i * gap
+                    else:
+                        error = "Unknown action for this target"
+                if ids is None and action in ("mode", "kiosk", "locked"):
+                    # For all phones: every phone's own choice of it goes, and a new choice starts the tour again from
+                    # the intro (carrying on mid-tour at "Vaše farby" after holding the QR code looked broken).
+                    for own in saved["devices"].values():
+                        for key in (("mode", "hold") if action == "mode" else (action,)):
+                            own.pop(key, None)
+                    if action == "mode":
+                        saved["epoch"] = at
+            demo_write(change)
+            if error:
+                return self.error(400, error)
+            audit(user["username"], f"demo phones{' ' + device if device else ' group ' + group if group else ''}: "
+                                    f"{action} {data.get('mode', '')} {data.get('hold', '')} {data.get('on', '')}".strip())
+            demo_push(pushed)
+            return self.send(200, {"ok": True})
         if method == "POST" and route == "server/backup":
             return self.send(200, {"ok": True, "name": backup_db().name, "backups": list_backups()})
         if method == "GET" and route == "audit":
@@ -4698,7 +5088,23 @@ class Handler(BaseHTTPRequestHandler):
             messages = conn.execute("SELECT * FROM bug_messages WHERE bug_id=? ORDER BY id", (bug_id,)).fetchall()
             images = conn.execute("SELECT id, mime, length(data) size FROM bug_images WHERE bug_id=? ORDER BY id", (bug_id,)).fetchall()
             return self.send(200, dict(bug, code=bug_code(bug_id), messages=[dict(m) for m in messages],
-                                       images=[dict(i) for i in images], lang=bug_lang(bug), similar=similar_bugs(conn, bug)))
+                                       images=[dict(i) for i in images], lang=bug_lang(bug), similar=similar_bugs(conn, bug),
+                                       video={"size": video_of(bug_id).stat().st_size} if video_of(bug_id) else None))
+        if method == "GET" and action == "video":
+            file = video_of(bug_id)
+            if not file:
+                return self.error(404, "No video")
+            blob, total = file.read_bytes(), file.stat().st_size
+            headers = {"Cache-Control": "private, max-age=86400", "Content-Security-Policy": "default-src 'none'; sandbox",
+                       "Accept-Ranges": "bytes", "Content-Disposition": f'inline; filename="{bug_code(bug_id)}{file.suffix}"'}
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range") or "")
+            if m and (m[1] or m[2]):
+                first, last = (int(m[1]), min(int(m[2] or total - 1), total - 1)) if m[1] else (max(0, total - int(m[2])), total - 1)
+                if first > last:
+                    return self.send(416, b"", "text/plain", {"Content-Range": f"bytes */{total}"})
+                headers["Content-Range"] = f"bytes {first}-{last}/{total}"
+                return self.send(206, blob[first:last + 1], "video/quicktime" if file.suffix == ".mov" else "video/mp4", headers)
+            return self.send(200, blob, "video/quicktime" if file.suffix == ".mov" else "video/mp4", headers)
         if method == "GET" and action.startswith("images/") and action[7:].isdigit():
             image = conn.execute("SELECT mime, data FROM bug_images WHERE id=? AND bug_id=?", (int(action[7:]), bug_id)).fetchone()
             if not image:

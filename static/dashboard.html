@@ -1094,6 +1094,7 @@ async function renderServer() {
         <div class="stat"><b class="${diskUsed > 0.9 ? "warn-text" : ""}">${bytes(h.disk.free)}</b><span>disk free, database ${bytes(h.dbSize)}</span></div>
       </div>
     </div>
+    <div class="section" id="demo-phones"></div>
     <div class="section">
       <div class="row" style="justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px"><h2>Database backups</h2>
         <button class="btn" type="button" id="backup-now">Back up now</button></div>
@@ -1124,11 +1125,176 @@ async function renderServer() {
         <tbody>${h.reportedVersions.map((v) => `<tr><td data-label="In reports">${esc(v.version)}</td><td data-label="Platform">${esc(v.platform)}</td>
           <td data-label="Reports">${v.reports}</td><td data-label="Last">${ago(v.last)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No reports yet.</p>`}
     </div>`;
+  renderDemo();
   $("#backup-now").onclick = async (e) => {
     e.target.disabled = true;
     try { const r = await api("server/backup", {}); toast("Backed up: " + r.name); renderServer(); }
     catch (err) { toast(err.message); e.target.disabled = false; }
   };
+}
+
+// ------------------------------------------------------------------ open day demo phones (the app's demo build)
+
+/** The demo phones: what all of them show (one shared tour clock), groups and each one's own choice, kiosk and lock, updates. Updates every 5 s. */
+async function renderDemo() {
+  const box = $("#demo-phones");
+  if (!box) return;
+  let d;
+  try { d = await api("demo"); } catch (err) { box.innerHTML = `<h2>Demo phones</h2><p class="muted">${esc(err.message)}</p>`; return; }
+  // The steps the phones offer (each a step a phone can start at; the ones that need it go with it).
+  const steps = [];
+  for (const dev of d.devices) for (const [id, label] of dev.steps || []) if (!steps.some((s) => s[0] === id)) steps.push([id, label]);
+  const label = (id) => (steps.find((s) => s[0] === id) || [id, id])[1];
+  const shows = (m, hold) => m === "tour" ? "Tour" : m === "hold" ? "Holding: " + label(hold) : "No tour";
+  const minutes = (s) => s < 60 ? `${s} s` : `${Math.round(s / 60)} min`;
+  const choice = (current, hold, withAll) => `<select data-mode>
+      ${withAll ? `<option value=""${current === "" ? " selected" : ""}>As all phones</option>` : ""}
+      <option value="tour"${current === "tour" ? " selected" : ""}>Tour</option>
+      ${steps.map(([id, l]) => `<option value="hold:${esc(id)}"${current === "hold" && hold === id ? " selected" : ""}>Hold: ${esc(l)}</option>`).join("")}
+      <option value="off"${current === "off" ? " selected" : ""}>No tour</option></select>`;
+  // The tour's own order: the saved one, then any step the phones have that it doesn't list yet (unticked).
+  const order = (d.steps.length ? d.steps : steps.map((s) => s[0])).filter((id) => steps.some((s) => s[0] === id));
+  const unused = steps.map((s) => s[0]).filter((id) => !order.includes(id));
+  const quick = [["tour", "", "Tour"], ["hold", "try", "Google Play QR"], ["hold", "intro", "Intro"], ["hold", "follow", "Followed bus"]];
+  const battery = (x) => x.battery == null ? "" : `<span class="${!x.charging || x.battery < 20 ? "warn-text" : ""}">${x.battery} %${x.charging ? ", charging" : ", not charging"}</span>`;
+  const now = (x) => !x.online ? `<span class="warn-text">Offline, seen ${ago(x.seen)}</span>`
+    : x.updating ? `<b>Updating</b>: ${esc(x.updating)}`
+    : x.visitor ? `<b>Visitor</b>${x.screen ? ": " + esc(x.screen) : ""}` : x.touring ? esc(x.step || "Tour") : "Waiting";
+  // Kiosk and lock as the phone says it is, against what it should be.
+  const guard = (x) => [
+    x.kiosk ? (x.kioskOn ? "Kiosk" : x.owner ? '<span class="warn-text">Kiosk starting</span>' : '<span class="warn-text">Kiosk: not device owner</span>') : "",
+    x.locked ? (x.lockOn ? "Touch locked" : '<span class="warn-text">Lock not on</span>') : "",
+    x.unlocked ? '<span class="warn-text">Unlocked with the PIN</span>' : "",
+    x.current ? "" : '<span class="warn-text">Old build</span>',
+  ].filter(Boolean).join(", ");
+  const top = (o) => Object.entries(o || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${esc(label(k))} ${n}`).join(", ") || "none yet";
+  const target = `<select id="demo-target"><option value="">All phones</option>
+      ${d.groups.map((g) => `<option value="group:${esc(g)}">Group: ${esc(g)}</option>`).join("")}
+      ${d.devices.map((x) => `<option value="device:${esc(x.id)}">${esc(x.name || x.model || x.id)}</option>`).join("")}</select>`;
+  box.innerHTML = `
+    <div class="row" style="justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px"><h2>Demo phones</h2>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <button class="btn" type="button" data-act="restart" title="Every phone nobody is using starts the tour from the beginning, together">Restart tour together</button>
+        <button class="btn" type="button" data-act="reset" title="Every phone forgets what the visitor did and goes back to what it should show">Reset all now</button></div></div>
+    <p class="muted" style="max-width:72ch;margin:0 0 12px">Phones running the demo build. The ones nobody is touching show the same thing at the same time.
+      Today ${d.visits} ${d.visits === 1 ? "visitor" : "visitors"} tried them, ${minutes(d.visitSeconds)} in all; the QR code was scanned ${d.stats.qr || 0}×.</p>
+    <p class="muted small" style="max-width:72ch;margin:0 0 12px">Picked up at: ${top(d.stats.steps)}. Tabs opened: ${top(d.stats.tabs)}.</p>
+    <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      ${quick.map(([m, h, l]) => `<button class="btn${d.mode === m && (m !== "hold" || d.hold === h) ? " primary" : ""}" type="button" data-quick="${m}:${h}">${l}</button>`).join("")}
+    </div>
+    <div class="row" style="gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+      <label>All phones ${choice(d.mode, d.hold, false)}</label>
+      <label>Back after <input type="number" id="demo-idle" min="15" max="600" value="${d.idleSeconds}" style="width:5em"> s</label></div>
+    <fieldset style="margin:0 0 12px;border:1px solid var(--line);border-radius:12px;padding:10px 12px">
+      <legend><b>Kiosk, lock and the app</b></legend>
+      <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+        <label>For ${target}</label>
+        <button class="btn" type="button" data-guard="kiosk:1" title="The app holds the screen: no home, recents or status bar (the app must be the device owner)">Kiosk on</button>
+        <button class="btn" type="button" data-guard="kiosk:0">Kiosk off</button>
+        <button class="btn" type="button" data-guard="locked:1" title="Touches do nothing: the phone shows only what you choose here">Lock touch</button>
+        <button class="btn" type="button" data-guard="locked:0">Unlock touch</button>
+        <button class="btn" type="button" data-guard="follow" title="A group or phone goes back to what all phones do">As all phones</button>
+        <button class="btn" type="button" data-guard="update" ${d.apk.sha256 ? "" : "disabled"} title="Install the uploaded build">Update the app</button>
+        <button class="btn danger" type="button" data-guard="remove" title="Kiosk off, the device owner given up and the app's uninstall asked (one tap on the phone)">Remove the app</button></div>
+      <p class="muted small" style="margin:8px 0 0">Now for all phones: kiosk ${d.kiosk ? "on" : "off"}, touch ${d.locked ? "locked" : "free"}.
+        Unlock a phone on the spot: tap its top left corner five times, then PIN <b>${esc(d.pin)}</b>
+        <button class="btn small" type="button" id="demo-pin">Change</button>.
+        A phone that can't reach emHUB for 10 minutes unlocks by itself.</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
+        <span>Build: ${d.apk.sha256 ? `${esc(d.apk.sha256.slice(0, 12))}, ${Math.round(d.apk.size / 1024)} kB, ${ago(d.apk.at)}` : "none uploaded"}</span>
+        <input type="file" id="demo-apk" accept=".apk"><button class="btn" type="button" id="demo-apk-send">Upload</button></div>
+    </fieldset>
+    <details style="margin-bottom:12px"><summary><b>Message on the screens</b>${d.message ? ` <span class="muted">now: ${esc(d.message)}</span>` : ""}</summary>
+      <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-start;margin-top:8px">
+        <textarea id="demo-text" rows="2" maxlength="300" style="flex:1;min-width:16em" placeholder="Prednáška o Plan&amp;Ride o 14:00 v učebni 12">${esc(d.message)}</textarea>
+        <select id="demo-style"><option value="slide"${d.messageStyle === "slide" ? " selected" : ""}>Full screen, when nobody uses the phone</option>
+          <option value="strip"${d.messageStyle === "strip" ? " selected" : ""}>In the top strip, always</option></select>
+        <button class="btn primary" type="button" id="demo-show">Show</button><button class="btn" type="button" id="demo-clear">Remove</button></div>
+      <p class="muted small" style="margin:6px 0 0">For the phones chosen under Kiosk, lock and the app.</p></details>
+    <details style="margin-bottom:12px"><summary><b>Tour content</b> <span class="muted">${order.length} of ${steps.length} steps</span></summary>
+      <p class="muted small" style="margin:6px 0">Tick what the tour shows and set the order. Saving starts the tour again on all phones.</p>
+      <ol id="demo-steps" style="margin:0;padding-left:1.6em">
+        ${[...order.map((id) => [id, true]), ...unused.map((id) => [id, false])].map(([id, on]) => `<li data-step="${esc(id)}" style="margin:2px 0">
+          <label><input type="checkbox"${on ? " checked" : ""}> ${esc(label(id))}</label>
+          <button class="btn small" type="button" data-move="-1" aria-label="Earlier">&uarr;</button><button class="btn small" type="button" data-move="1" aria-label="Later">&darr;</button></li>`).join("")}
+      </ol>
+      <div class="row" style="gap:8px;margin-top:8px"><button class="btn primary" type="button" id="demo-steps-save">Save tour</button>
+        <button class="btn" type="button" id="demo-steps-all">All, in the app's order</button></div></details>
+    <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+      <b>Wave</b><label>each phone <input type="number" id="demo-gap" min="100" max="5000" step="100" value="700" style="width:5.5em"> ms after the one before</label>
+      <button class="btn" type="button" data-act="wave" title="In the list's order, online phones only">Start wave</button>
+      <button class="btn" type="button" data-act="line">All together</button></div>
+    ${d.devices.length ? `<div class="table-wrap"><table class="grid"><thead><tr><th>Phone</th><th>Now</th><th>Battery</th><th>Today</th><th>Shows</th><th></th></tr></thead><tbody>
+      ${d.devices.map((x) => `<tr data-device="${esc(x.id)}">
+        <td data-label="Phone"><b>${esc(x.name || x.model || x.id)}</b><div class="muted small">${x.group ? `Group ${esc(x.group)}, ` : ""}${esc(x.model)} ${esc(x.version)}${x.offsetMs ? `, +${x.offsetMs} ms` : ""}</div></td>
+        <td data-label="Now">${now(x)}${x.message ? `<div class="muted small">Message: ${esc(x.message)}</div>` : ""}<div class="small">${guard(x)}</div></td>
+        <td data-label="Battery">${battery(x)}</td>
+        <td data-label="Today">${x.visits} ${x.visits === 1 ? "visit" : "visits"}, ${minutes(x.visitSeconds)}</td>
+        <td data-label="Shows">${choice(x.own, x.hold, true)}<div class="muted small">${esc(shows(x.mode, x.hold))}</div></td>
+        <td><button class="btn" type="button" data-act="blink" title="Its screen flashes with its name">Blink</button>
+          <button class="btn" type="button" data-act="name">Rename</button> <button class="btn" type="button" data-act="setgroup">Group</button>
+          <button class="btn" type="button" data-act="reset">Reset</button></td></tr>`).join("")}
+      </tbody></table></div>` : `<p class="muted">No demo phone has connected yet.</p>`}`;
+  const send = async (body) => { try { await api("demo", body); renderDemo(); } catch (err) { toast(err.message); } };
+  // The target chosen under Kiosk, lock and the app (it stays chosen across the 5 s refresh).
+  const sel = $("#demo-target");
+  if ([...sel.options].some((o) => o.value === renderDemo.target)) sel.value = renderDemo.target;
+  sel.onchange = () => { renderDemo.target = sel.value; };
+  const aimed = () => {
+    const [kind, id] = (sel.value || ":").split(/:(.*)/);
+    return kind === "device" ? { device: id } : kind === "group" ? { group: id } : {};
+  };
+  const aimedName = () => sel.options[sel.selectedIndex].text;
+  box.querySelectorAll("select[data-mode]").forEach((s) => s.onchange = () => {
+    const [mode, hold] = s.value.split(":");
+    send({ action: "mode", mode, hold: hold || "", device: s.closest("tr")?.dataset.device });
+  });
+  box.querySelectorAll("button[data-quick]").forEach((b) => b.onclick = () => {
+    const [mode, hold] = b.dataset.quick.split(":");
+    send({ action: "mode", mode, hold });
+  });
+  box.querySelectorAll("button[data-guard]").forEach((b) => b.onclick = () => {
+    const [action, on] = b.dataset.guard.split(":");
+    const to = aimed();
+    if ((action === "update" || action === "remove" || action === "follow") && !to.device && !to.group) {
+      // For every phone at once: each one by itself (a group or phone may also follow "all").
+      if (action === "follow") return toast("Choose a group or a phone");
+      if (!confirm(`${action === "update" ? "Update" : "Remove the app from"} every demo phone?`)) return;
+      return Promise.all(d.devices.map((x) => api("demo", { action, device: x.id }))).then(renderDemo, (err) => toast(err.message));
+    }
+    if (action === "remove" && !confirm(`Remove the app from ${aimedName()}? The kiosk ends, the app stops being the device owner and asks to be uninstalled.`)) return;
+    send({ action, on: on === "1", ...to });
+  });
+  box.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => {
+    const device = b.closest("tr")?.dataset.device, act = b.dataset.act;
+    if (act === "name" || act === "setgroup") {
+      const name = prompt(act === "name" ? "Name for this phone" : "Group (empty: none)", "");
+      if (name !== null) send({ action: act, device, name });
+    } else if (act === "wave") send({ action: "wave", gapMs: +$("#demo-gap").value });
+    else send({ action: act, device });
+  });
+  $("#demo-idle").onchange = (e) => send({ action: "idle", idleSeconds: +e.target.value });
+  $("#demo-pin").onclick = () => { const pin = prompt("New PIN, 4 to 8 digits", ""); if (pin) send({ action: "pin", pin }); };
+  $("#demo-apk-send").onclick = async () => {
+    const file = $("#demo-apk").files[0];
+    if (!file) return toast("Choose the demo APK first");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    try { await api("demo/apk", { apk: btoa(bin) }); toast("Uploaded. Choose the phones and press Update the app."); renderDemo(); } catch (err) { toast(err.message); }
+  };
+  $("#demo-show").onclick = () => send({ action: "message", text: $("#demo-text").value, style: $("#demo-style").value, ...aimed() });
+  $("#demo-clear").onclick = () => send({ action: "message", text: "", ...aimed() });
+  box.querySelectorAll("[data-move]").forEach((b) => b.onclick = () => {
+    const li = b.closest("li"), other = +b.dataset.move < 0 ? li.previousElementSibling : li.nextElementSibling;
+    if (other) +b.dataset.move < 0 ? other.before(li) : other.after(li);
+  });
+  $("#demo-steps-save").onclick = () => send({ action: "steps", steps: [...box.querySelectorAll("#demo-steps li")].filter((li) => li.querySelector("input").checked).map((li) => li.dataset.step) });
+  $("#demo-steps-all").onclick = () => send({ action: "steps", steps: [] });
+  // Every 5 s, but not while something here is being typed or chosen, or a part is open.
+  clearTimeout(renderDemo.t);
+  const busy = () => box.contains(document.activeElement) || box.querySelector("details[open]") || $("#demo-apk")?.files.length;
+  renderDemo.t = setTimeout(function again() { if (!$("#demo-phones")) return; if (busy()) renderDemo.t = setTimeout(again, 5000); else renderDemo(); }, 5000);
 }
 
 // ------------------------------------------------------------------ riders' submissions (2.17.0)
@@ -1272,7 +1438,9 @@ async function renderBug(id) {
     <div data-panel="report"><p class="desc">${esc(bug.description)}</p>
       ${bug.images?.length ? `<div class="row" style="gap:10px;margin-top:14px">${bug.images.map((i) =>
         `<a href="/admin/api/bugs/${bug.id}/images/${i.id}" data-view title="Open">
-          <img src="/admin/api/bugs/${bug.id}/images/${i.id}" alt="Image from the reporter" style="max-height:220px;max-width:100%;border:1px solid var(--line);border-radius:4px"></a>`).join("")}</div>` : ""}</div>
+          <img src="/admin/api/bugs/${bug.id}/images/${i.id}" alt="Image from the reporter" style="max-height:220px;max-width:100%;border:1px solid var(--line);border-radius:4px"></a>`).join("")}</div>` : ""}
+      ${bug.video ? `<div style="margin-top:14px"><video controls preload="metadata" src="/admin/api/bugs/${bug.id}/video" style="max-height:420px;max-width:100%;border:1px solid var(--line);border-radius:4px"></video>
+        <div class="muted small">Video, ${Math.round(bug.video.size / 1e5) / 10} MB. <a href="/admin/api/bugs/${bug.id}/video" download>Download</a> (an iPhone's HEVC video may not play in every browser)</div></div>` : ""}</div>
     <div data-panel="logs" hidden>
       ${bug.logs ? `<div class="logs-tools"><input class="input" id="log-filter" type="search" placeholder="Filter lines" style="flex:1"><button class="btn quiet" id="log-dl" type="button">Download</button></div><div class="logs" id="logs"></div>` : `<p class="muted">No logs were attached.</p>`}
     </div>

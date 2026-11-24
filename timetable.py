@@ -137,7 +137,8 @@ SLACK_S, SLACK_SHARE = 10 * 60, 0.15  # a journey with fewer changes may arrive 
 MODES = {0: "tram", 2: "rail", 3: "bus", 11: "trolleybus", 200: "coach"}
 NEVER = ("deleted", "")    # the service of a trip whose stops were deleted in the map editor: no day
 CITY_FEED = "sad-zvolen-as-city"   # S.A.D. Zvolen city buses read from sadzv (sadzv.collect)
-CITY_FEEDS = {CITY_FEED, "dpb", "mhd-pezinok", "mhd-malacky", "mhd-topolcany", "dpmp"}   # city transport (the "city" group)
+DPMBB_FEED = "dpmbb"                # Banská Bystrica's lines 1-8 from DPMBB's published timetables (dpmbb.json)
+CITY_FEEDS = {CITY_FEED, DPMBB_FEED, "dpb", "mhd-pezinok", "mhd-malacky", "mhd-topolcany", "dpmp"}   # city transport (the "city" group)
 def city_operator(lat):
     """sadzv doesn't say who runs a line (DPMBB or S.A.D. Zvolen in Banská Bystrica), so name the city's transport."""
     return "MHD Banská Bystrica" if lat and lat > 48.66 else "MHD Zvolen"
@@ -223,7 +224,7 @@ def match_score(tokens, words):
 # ------------------------------------------------------------------ the loaded timetable
 
 class Timetable:
-    def __init__(self, feeds, today=None, city=()):
+    def __init__(self, feeds, today=None, city=(), dpmbb=None):
         """feeds: {name: path to GTFS zip}; city: days of city buses read by sadzv.collect."""
         today = today or datetime.now(ZONE).date()
         self.built = time.time()
@@ -273,6 +274,11 @@ class Timetable:
         except Exception:  # noqa: BLE001 - the regional timetable still works without city buses
             traceback.print_exc()
             log("city buses: could not add them")
+        try:
+            self._add_dpmbb(dpmbb)
+        except Exception:  # noqa: BLE001 - the rest of the timetable still works without them
+            traceback.print_exc()
+            log("DPMBB: could not add its trips")
         try:
             self._add_extra()
         except Exception:  # noqa: BLE001 - a bad approved submission must not stop the timetable
@@ -388,6 +394,77 @@ class Timetable:
             for s, _ in stops:
                 self.weight[s] += 1
 
+    def _add_dpmbb(self, data):
+        """
+        Banská Bystrica's lines 1-8 as DPMBB publishes them (dpmbb.json): sadzv has only
+        part of their trips (trolleybus 6 at 7:38 from Štadlerovo nábrežie was missing, submission 5). A trip sadzv
+        already has (same line, half its stops at the same times, same kind of day) is left to sadzv, whose buses are live.
+        """
+        if not data:
+            return
+        bb = lambda s: self.lat[s] is not None and 48.66 < self.lat[s] < 48.80 and 19.0 < self.lon[s] < 19.3  # noqa: E731
+        key = lambda name: "".join(fold(name))  # noqa: E731 - "Úrad PV SR" is sadzv's "Úrad PVSR"
+        by_name = {}
+        for pid, s in getattr(self, "city_station_of", {}).items():
+            if bb(s):
+                by_name.setdefault(key(self.city_platforms[pid][0]), s)
+        town = [s for s in range(len(self.names)) if self.names[s].startswith("Banská Bystrica,") and bb(s)]
+
+        def station(name):
+            if key(name) in by_name:
+                return by_name[key(name)]
+            words = fold(name)
+            # Our shortened names: "Roosevelt.nem." is "Rooseveltova nemocnica", "Nám.Ľ.Štúra" is "Námestie Ľ. Štúra, Kaufland".
+            fits = [s for s in town if len(fold(self.names[s].split(",", 1)[1])) >= 2  # one word ("Tajovského") is too loose
+                    and match_score(fold(self.names[s].split(",", 1)[1]), words) is not None]
+            s = min(fits, key=lambda s: len(self.names[s])) if fits else None
+            by_name[key(name)] = s
+            return s
+
+        def kind(n):
+            return max((self.first_day + timedelta(days=n)).weekday(), 4)  # 4 workday, 5 Saturday, 6 Sunday
+        have = set()
+        for t in self.trips:
+            if t[0] == CITY_FEED:
+                for k in {kind(n) for n in self.services.get(t[6], ())}:
+                    have.update((t[2], s, secs % 86400, k) for s, secs in zip(t[7], t[9]))
+        added = same = 0
+        missing = set()
+        for x in data.get("trips", []):
+            rows = []
+            for name, secs in x["stops"]:
+                s = station(name)
+                if s is None:
+                    missing.add(name)
+                elif not rows or rows[-1][0] != s:
+                    rows.append((s, secs))
+            if len(rows) < 2:
+                continue
+            # Kind by kind of day (a weekend trip sadzv has on Sunday may still be missing on Saturday). At least half its
+            # stops at the same times: two shared stops alone were another trip (22:39 at Štadlerovo nábrežie).
+            days = set(x["days"])
+            for k in {max(d, 4) for d in x["days"]}:
+                if sum((x["line"], s, secs % 86400, k) in have for s, secs in rows) >= max(2, len(rows) // 2):
+                    days -= {0, 1, 2, 3, 4} if k == 4 else {k}
+            if not days:
+                same += 1
+                continue
+            service = (DPMBB_FEED, f'{x["line"]}-{x["trip"]}')
+            start = x.get("validFrom") or "0000-00-00"
+            self.services[service] = {n for n in range(DAYS_BACK + DAYS_AHEAD + 1)
+                                      if (self.first_day + timedelta(days=n)).weekday() in days
+                                      and (self.first_day + timedelta(days=n)).isoformat() >= start}
+            trip_id = f'{x["line"]}-{x["trip"]}'
+            self.trip_index[(DPMBB_FEED, trip_id)] = len(self.trips)
+            times = tuple(secs for _, secs in rows)
+            self.trips.append((DPMBB_FEED, trip_id, x["line"], self.names[rows[-1][0]], data.get("operator", "DPMBB"), "trolleybus",
+                               service, tuple(s for s, _ in rows), times, times, tuple("" for _ in rows)))
+            for s, _ in rows:
+                self.weight[s] += 1
+            added += 1
+        self.feeds[DPMBB_FEED] = added
+        log(f"DPMBB: {added} trips added, {same} already in sadzv" + (f"; stops not found: {', '.join(sorted(missing))}" if missing else ""))
+
     def _add_city(self, collections):
         """
         S.A.D. Zvolen city buses, each read day also standing in for later days of the same kind
@@ -396,7 +473,10 @@ class Timetable:
         """
         if not collections:
             return
-        collections = sorted(collections, key=lambda c: c["date"])
+        # A day saved with no trips (sadzv answering empty, 24 Nov) must not stand for that date: the last day of its kind does.
+        collections = sorted((c for c in collections if c.get("trips")), key=lambda c: c["date"])
+        if not collections:
+            return
         kind = lambda d: max(d.weekday(), 4)  # noqa: E731 - 4 workday, 5 Saturday, 6 Sunday; ponytail: holidays count as workdays
         read = [date.fromisoformat(c["date"]) for c in collections]
         use = {}
@@ -445,6 +525,7 @@ class Timetable:
                 count += 1
         self.feeds[CITY_FEED] = count
         self.platforms_of = platforms_of
+        self.city_station_of = station_of
         self.apply_routes()
 
     def apply_routes(self):
@@ -2261,7 +2342,8 @@ def load(folder, feeds):
     global current
     started = time.time()
     paths = {f: folder / f"{f}.zip" for f in feeds if (folder / f"{f}.zip").exists()}
-    built = Timetable(paths, city=city_days(folder))
+    dpmbb = folder / f"{DPMBB_FEED}.json"
+    built = Timetable(paths, city=city_days(folder), dpmbb=json.loads(dpmbb.read_text(encoding="utf-8")) if dpmbb.exists() else None)
     today = datetime.now(ZONE).date()
     for d in (today - timedelta(days=1), today, today + timedelta(days=1)):  # the map's buses now and the first search mustn't wait
         built.day(d)
@@ -2303,9 +2385,12 @@ def update(folder, feeds, fetch=True):
             download(folder, feeds)
         if _collect:
             try:
-                _collect(folder)
+                if _collect(folder):
+                    downloads[CITY_FEED] = {"at": int(time.time()), "result": "read"}
             except Exception as error:  # noqa: BLE001 - the previous days still stand in
                 log(f"city buses not read: {error}")
+                # emHUB's feed alert: the trip count hardly moves (earlier days stand in), so say it outright.
+                downloads[CITY_FEED] = {"at": int(time.time()), "result": f"not read: {error}"}
         load(folder, feeds)
     except Exception as error:  # noqa: BLE001 - keep the previous timetable
         traceback.print_exc()
@@ -2354,6 +2439,8 @@ def status(folder, feeds):
         files[CITY_FEED] = {"size": days[-1].stat().st_size, "modified": int(days[-1].stat().st_mtime),
                             "trips": t.feeds.get(CITY_FEED) if t else None,
                             "result": f"{len(days)} days read from sadzv, latest {days[-1].stem[6:]}", "at": int(days[-1].stat().st_mtime)}
+        if downloads.get(CITY_FEED, {}).get("result", "").startswith("not read"):  # today's read failed: the Timetable page says so
+            files[CITY_FEED].update(downloads[CITY_FEED], result=downloads[CITY_FEED]["result"] + "; " + files[CITY_FEED]["result"])
     return {"ready": t is not None, "busy": _update_lock.locked(), "builtAt": int(t.built) if t else None,
             "trips": len(t.trips) if t else 0, "stations": len(t.names) if t else 0, "feeds": files,
             "log": [{"at": at, "text": text} for at, text in reversed(LOG)]}
