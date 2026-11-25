@@ -58,7 +58,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.62.1"
+VERSION = "1.63.0"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -325,6 +325,13 @@ CREATE TABLE IF NOT EXISTS bugs (
   device TEXT NOT NULL DEFAULT '',
   logs TEXT NOT NULL DEFAULT '',
   consent_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS submission_images (
+  id INTEGER PRIMARY KEY,
+  submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  mime TEXT NOT NULL,
+  data BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS bug_images (
   id INTEGER PRIMARY KEY,
@@ -3833,7 +3840,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not submission_limiter.allow(self.client_ip()):
             return self.error(429, "Too many submissions, try again later", cors=True)
-        data = self.json_body(limit=20_000)
+        data = self.json_body(limit=18_000_000)  # 1.63.0: up to 3 screenshots (EM-0120)
         kind, name = data.get("kind"), clean(data.get("name"), 80)
         if kind not in ("stop", "trip", "problem") or not name:
             return self.error(400, "kind (stop, trip or problem) and name are required", cors=True)
@@ -3866,11 +3873,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not text:
                     raise ValueError("Say what the problem is")
                 body = {"station": clean(data.get("station"), 200), "text": text}
+            if isinstance(data.get("images"), list) and len(data["images"]) > 3:
+                raise ValueError("At most 3 screenshots")
+            images = bug_images(data.get("images"))  # JPEG only, location and other photo details dropped
         except (KeyError, TypeError, ValueError) as error:
             return self.error(400, str(error) if isinstance(error, ValueError) and str(error)[:1].isupper() else "Check the details", cors=True)
         with db() as conn:
             sid = conn.execute("INSERT INTO submissions(created_at, kind, name, email, data) VALUES (?,?,?,?,?)",
                                (now(), kind, name, clean(data.get("email"), 120), json.dumps(body))).lastrowid
+            for mime, blob in images:
+                conn.execute("INSERT INTO submission_images(submission_id, created_at, mime, data) VALUES (?,?,?,?)", (sid, now(), mime, blob))
         publish("submissions")
         return self.send(201, {"id": sid}, headers=self.cors())
 
@@ -4392,11 +4404,26 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 rows = [dict(r, data=json.loads(r["data"])) for r in conn.execute(
                     "SELECT * FROM submissions ORDER BY status='new' DESC, id DESC LIMIT 300")]
+                shots = {}
+                for r in conn.execute("SELECT id, submission_id FROM submission_images ORDER BY id"):
+                    shots.setdefault(r["submission_id"], []).append(r["id"])
+            for r in rows:
+                r["images"] = shots.get(r["id"], [])
             t = timetable.current
             for r in rows:  # the stops of a trip by name, for reading it
                 if r["kind"] == "trip" and t is not None:
                     r["data"]["stopNames"] = [t.names[t.by_id[s]] if s in t.by_id else s for s, _ in r["data"]["stops"]]
             return self.send(200, {"submissions": rows})
+        if method == "GET" and re.fullmatch(r"submissions/\d+/images/\d+", route):
+            _, sub_id, _, image_id = route.split("/")
+            with db() as conn:
+                image = conn.execute("SELECT mime, data FROM submission_images WHERE id=? AND submission_id=?", (int(image_id), int(sub_id))).fetchone()
+            if not image:
+                return self.error(404, "No such image")
+            # A rider's bytes: never sniffed, scripted or framed, even when opened on their own (as a bug report's).
+            return self.send(200, bytes(image["data"]), image["mime"], {
+                "Cache-Control": "private, max-age=86400", "Content-Security-Policy": "default-src 'none'; sandbox",
+                "Content-Disposition": f'inline; filename="submission-{sub_id}-{image_id}.jpg"'})
         if method == "POST" and re.fullmatch(r"submissions/\d+/(approve|reject|done)", route):
             sid, action = int(route.split("/")[1]), route.split("/")[2]
             note = clean(self.json_body().get("note"), 500)

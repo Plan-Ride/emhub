@@ -61,7 +61,7 @@ R = [
     ("GET", f"bugs?kind=bug", "bugs"), ("GET", "bugs?kind=feature", "ideas"), ("GET", f"bugs/{bug_id}", "bugs"), ("GET", f"bugs/{idea_id}", "ideas"),
     ("GET", f"bugs/{bug_id}/images/1", "bugs"), ("POST", f"bugs/{bug_id}/note", "bugs"), ("POST", f"bugs/{idea_id}/note", "ideas"),
     ("POST", f"bugs/{bug_id}/status", "bugs"), ("POST", f"bugs/{bug_id}/meta", "bugs"), ("POST", f"bugs/{bug_id}/reply", "bugs"),
-    ("GET", "submissions", "submissions"), ("POST", "submissions/1/approve", "submissions"),
+    ("GET", "submissions", "submissions"), ("GET", "submissions/1/images/1", "submissions"), ("POST", "submissions/1/approve", "submissions"),
     ("GET", "lines", "lines"), ("POST", "lines", "lines"), ("POST", "lines/1", "lines"), ("POST", "lines/1/delete", "lines"),
     ("GET", "links", "lines"), ("GET", "links/candidates?from=1&to=2", "lines"), ("POST", "links", "lines"), ("POST", "links/1/delete", "lines"),
     ("GET", "releases/2.0/draft", "releases"), ("POST", "releases/2.0/notes", "releases"), ("POST", "releases/2.0/release", "releases"),

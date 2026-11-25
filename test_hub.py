@@ -686,6 +686,19 @@ assert status == 201, sub_trip
 status, sub_stop = v1("POST", "/api/v1/submissions", {"kind": "stop", "name": "Ben", "stopName": "Town, New Corner", "lat": 48.701, "lon": 19.101})
 assert status == 201
 assert v1("POST", "/api/v1/submissions", {"kind": "problem", "name": "Cy", "station": "town as", "text": "Timetable missing"})[0] == 201
+# EM-0120: up to 3 screenshots with a submission, cleaned like a report's photos, shown to admins only.
+assert v1("POST", "/api/v1/submissions", {"kind": "problem", "name": "Cy", "station": "town as", "text": "x",
+                                          "images": [b64(jpeg())] * 4})[0] == 400, "at most 3 screenshots"
+assert v1("POST", "/api/v1/submissions", {"kind": "problem", "name": "Cy", "station": "town as", "text": "x", "images": ["bm90IGEganBlZw=="]})[0] == 400
+status, shot = v1("POST", "/api/v1/submissions", {"kind": "problem", "name": "Cy", "station": "town as", "text": "Seen at the stop",
+                                                  "images": [b64(jpeg(tail=b"<script>"))]})
+assert status == 201, shot
+with_shot = next(s for s in admin_get("submissions")["submissions"] if s["id"] == shot["id"])
+assert len(with_shot["images"]) == 1, with_shot
+status, headers, body = call("/admin/api/submissions/%d/images/%d" % (shot["id"], with_shot["images"][0]), cookie=cookie)
+assert status == 200 and "sandbox" in headers["Content-Security-Policy"] and b"GPS" not in body and b"script" not in body
+assert call("/admin/api/submissions/%d/images/%d" % (shot["id"], with_shot["images"][0]))[0] == 401, "admins only"
+print("ok submission screenshots")
 listed = admin_get("submissions")["submissions"]
 assert {s["kind"] for s in listed} >= {"trip", "stop", "problem"} and all(s["status"] == "new" for s in listed[:3])
 assert [s for s in listed if s["id"] == sub_trip["id"]][0]["data"]["stopNames"][0] == tt.names[tt.by_id["town as"]]
