@@ -1570,46 +1570,98 @@ def p2p_sign(d, message):
     return b"\x30" + bytes([len(body)]) + body
 
 
-def p2p_wire(vehicles, at, d, lat, lon):
+def p2p_signed(d, head, rows):
     """
-    What a phone broadcasts: deflate(JSON {"p": payload, "s": base64 signature}), the payload
-    {"v": 1, "at": epoch s, "b": [[hub trip id, sadzv line id, sadzv trip number, delay s]]}: the live buses nearest the
-    phone, as many as fit in one Bluetooth LE read. Nothing about the phone that asked is in it.
+    One broadcast packet: deflate(JSON {"p": payload, "s": base64 signature}), the payload head + {"r": rows}; rows are
+    dropped from the end until it fits one Bluetooth LE read. Returns (wire, rows kept).
     """
-    live = sorted((v for v in vehicles if v.get("delay") is not None),
-                  key=lambda v: (v["lat"] - lat) ** 2 + ((v["lon"] - lon) * 0.66) ** 2)
-    rows = [[v["tripId"], *(v.get("sadzv") or [0, 0]), int(v["delay"])] for v in live]
     while True:
-        payload = json.dumps({"v": 1, "at": at, "b": rows}, separators=(",", ":"))
+        payload = json.dumps(dict(head, r=rows), separators=(",", ":"), ensure_ascii=False)
         wire = zlib.compress(json.dumps({"p": payload, "s": base64.b64encode(p2p_sign(d, payload.encode())).decode()},
-                                        separators=(",", ":")).encode(), 9)
+                                        separators=(",", ":"), ensure_ascii=False).encode(), 9)
         if len(wire) <= P2P_WIRE_MAX or not rows:
             return wire, len(rows)
         rows = rows[:max(0, min(len(rows) - 1, len(rows) * P2P_WIRE_MAX // len(wire)))]
 
 
+def p2p_wire(vehicles, at, d, lat, lon, crowd_of=lambda keys: 0):
+    """
+    The buses packet {"v": 1, "k": "b", "at": epoch s, "r": [[hub trip id, sadzv line id, sadzv trip number, delay s,
+    how full 0-3]]}: the live buses nearest the phone. Nothing about the phone that asked is in it.
+    """
+    live = sorted((v for v in vehicles if v.get("delay") is not None),
+                  key=lambda v: (v["lat"] - lat) ** 2 + ((v["lon"] - lon) * 0.66) ** 2)
+    rows = [[v["tripId"], *(v.get("sadzv") or [0, 0]), int(v["delay"]), crowd_of(v.get("keys") or ())] for v in live]
+    return p2p_signed(d, {"v": 1, "k": "b", "at": at}, rows)
+
+
+def p2p_board_wire(station, departures, delays, notices, at, d):
+    """
+    The stop packet {"v": 1, "k": "s", "at", "st": stop name, "n": [[notice sk, notice en]], "r": [[line, headsign,
+    leaves epoch s, delay s or null]]}: the next departures from the stop nearest the phone, with the live delays known,
+    and the notices that concern it (its lines or its stop, or everyone).
+    """
+    rows = [[x["line"], x["headsign"][:28], x["at"] // 1000, delays.get(x["tripId"])] for x in departures]
+    return p2p_signed(d, {"v": 1, "k": "s", "at": at, "st": station, "n": notices}, rows)
+
+
+def p2p_notices(conn, station, lines):
+    """Up to two short notices for a stop: those naming one of its lines or the stop itself, and those for everyone."""
+    out = []
+    for n in active_notices(conn):
+        for_here = (not n["lines"] and not n["stops"]) or set(n["lines"]) & lines or any(x.lower() in station.lower() for x in n["stops"])
+        if for_here:
+            out.append([(n["title_sk"] or "")[:90], (n["title_en"] or n["title_sk"] or "")[:90]])
+    return out[:2]
+
+
 def p2p_pack(lat, lon):
-    """The signed packet for a place, kept 30 s per ~1 km square (phones ask every minute)."""
-    cell = (round(lat, 2), round(lon, 2))
-    with _p2p_lock:
-        hit = _p2p_cache.get(cell)
-        if hit and time.time() - hit[0] < 30:
-            return hit[1]
+    """
+    The signed packets for a place: the buses around (kept 30 s per ~1 km square) and the stop nearest the phone
+    (kept 30 s per stop). Phones ask every minute.
+    """
     t = timetable.current
     if t is None:
         return None
-    box = (lat - P2P_BOX[0], lon - P2P_BOX[1], lat + P2P_BOX[0], lon + P2P_BOX[1])
-    with db() as conn:
-        reported = {r[0] for r in conn.execute("SELECT DISTINCT trip_key FROM community_reports WHERE created_at>=?",
-                                               (now() - COMMUNITY_WINDOW_S,))}
-
-        def delay_of(keys):
-            return next((x for x in (trip_delay(conn, k) for k in keys if k in reported) if x), None)
-        vehicles = t.vehicles(int(time.time()), box, delay_of, sadzv.vehicles())
-    wire, count = p2p_wire(vehicles, now(), p2p_key(), lat, lon)
-    out = {"wire": base64.b64encode(wire).decode(), "buses": count, "at": now()}
+    cell = (round(lat, 2), round(lon, 2))
     with _p2p_lock:
-        _p2p_cache[cell] = (time.time(), out)
+        hit = _p2p_cache.get(cell)
+        fresh = hit and time.time() - hit[0] < 30
+    if fresh:
+        wire, count, delays = hit[1]
+    else:
+        box = (lat - P2P_BOX[0], lon - P2P_BOX[1], lat + P2P_BOX[0], lon + P2P_BOX[1])
+        with db() as conn:
+            reported = {r[0] for r in conn.execute("SELECT DISTINCT trip_key FROM community_reports WHERE created_at>=?",
+                                                   (now() - COMMUNITY_WINDOW_S,))}
+
+            def delay_of(keys):
+                return next((x for x in (trip_delay(conn, k) for k in keys if k in reported) if x), None)
+
+            def crowd_of(keys):
+                return next((c["level"] for c in (crowd_now(conn, k) for k in keys) if c), 0)
+            vehicles = t.vehicles(int(time.time()), box, delay_of, sadzv.vehicles(), with_keys=True)
+            wire, count = p2p_wire(vehicles, now(), p2p_key(), lat, lon, crowd_of)
+        delays = {v["tripId"]: int(v["delay"]) for v in vehicles if v.get("delay") is not None}
+        with _p2p_lock:
+            _p2p_cache[cell] = (time.time(), (wire, count, delays))
+    out = {"wire": base64.b64encode(wire).decode(), "buses": count, "at": now()}
+    near = t.near(lat, lon, 400, 1, timetable.GROUPS)
+    if near:
+        stop = near[0]
+        key = ("stop", stop["id"])
+        with _p2p_lock:
+            hit = _p2p_cache.get(key)
+            board = hit[1] if hit and time.time() - hit[0] < 30 else None
+        if board is None:
+            departures = t.departures([t.by_id[stop["id"]]], int(time.time()), limit=14, groups=timetable.GROUPS)
+            with db() as conn:
+                notices = p2p_notices(conn, stop["name"], {x["line"] for x in departures})
+            board = p2p_board_wire(stop["name"], departures, delays, notices, now(), p2p_key())[0]
+            with _p2p_lock:
+                _p2p_cache[key] = (time.time(), board)
+        out["board"] = base64.b64encode(board).decode()
+    with _p2p_lock:
         for old in [c for c, (at, _) in _p2p_cache.items() if time.time() - at > 120]:
             del _p2p_cache[old]
     return out

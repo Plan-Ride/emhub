@@ -1262,7 +1262,7 @@ class Timetable:
                     return {"lat": bus[0], "lon": bus[1], "delaySeconds": bus[2], "source": "city"}
         return None
 
-    def vehicles(self, when, box, delay_of=lambda keys: None, gps=None):
+    def vehicles(self, when, box, delay_of=lambda keys: None, gps=None, with_keys=False):
         """
         Buses on the road at `when` (epoch s) in box (south, west, north, east): where the timetable puts them, or, with
         riders' reports (delay_of(keys) -> {"delaySeconds", "source"}), as late as they are ("live"). Along the road
@@ -1323,7 +1323,9 @@ class Timetable:
                             "next": self.names[b], "live": bool(live), "delay": live["delaySeconds"] if live else None,
                             "source": live.get("source") if live else None, **({"plate": bus[4]} if bus and len(bus) > 4 else {}),
                             # 1.65.0: how the apps name a S.A.D. Zvolen city bus (sadzv line id, trip number), for nearby phones.
-                            **({"sadzv": [city[0], city[2]]} if city else {})})
+                            **({"sadzv": [city[0], city[2]]} if city else {}),
+                            # 1.65.0: the riders' keys of the trip, for how full it is (nearby phones' packets)
+                            **({"keys": keys} if with_keys else {})})
         return out
 
     def trip_shape(self, trip_id):

@@ -1606,12 +1606,25 @@ def _verify(pub_der, message, sig):
 key = 0x5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed
 pub = hub.p2p_public_der(key)
 assert len(pub) == 91 and _verify(pub, b"hello", hub.p2p_sign(key, b"hello")) and not _verify(pub, b"hellO", hub.p2p_sign(key, b"hello"))
-near = [{"tripId": f"sadzv:{i}:20261125", "lat": 48.7 + i / 1000, "lon": 19.1, "delay": 60 * i, "sadzv": [700 + i, i]} for i in range(200)]
-wire, count = hub.p2p_wire(near + [{"tripId": "x", "lat": 48.7, "lon": 19.1, "delay": None}], 1795600000, key, 48.7, 19.1)
+near = [{"tripId": f"sadzv:{i}:20261125", "lat": 48.7 + i / 1000, "lon": 19.1, "delay": 60 * i, "sadzv": [700 + i, i], "keys": [f"k{i}"]}
+        for i in range(200)]
+wire, count = hub.p2p_wire(near + [{"tripId": "x", "lat": 48.7, "lon": 19.1, "delay": None}], 1795600000, key, 48.7, 19.1,
+                           lambda keys: 2 if "k1" in keys else 0)
 assert len(wire) <= hub.P2P_WIRE_MAX and 5 < count < 200, (len(wire), count)
 outer = json.loads(zlib.decompress(wire))
 assert _verify(pub, outer["p"].encode(), base64.b64decode(outer["s"]))
 payload = json.loads(outer["p"])
-assert payload["v"] == 1 and payload["at"] == 1795600000 and payload["b"][0] == ["sadzv:0:20261125", 700, 0, 0], payload["b"][:2]
-assert all(row[0] != "x" for row in payload["b"]), "only buses with a known delay"
+assert payload["v"] == 1 and payload["k"] == "b" and payload["at"] == 1795600000, payload
+assert payload["r"][:2] == [["sadzv:0:20261125", 700, 0, 0, 0], ["sadzv:1:20261125", 701, 1, 60, 2]], payload["r"][:2]
+assert all(row[0] != "x" for row in payload["r"]), "only buses with a known delay"
+# The stop packet: its departures with the delays known, and its notices; long boards are cut to one read.
+deps = [{"line": str(30 + i), "headsign": f"Obec {i * 7919 % 10007} {i * 104729 % 99991}, dolný koniec", "at": (1795600000 + 60 * i) * 1000,
+         "tripId": f"t{i}"} for i in range(40)]
+board, kept = hub.p2p_board_wire("Banská Bystrica, Národná", deps, {"t1": 120}, [["Výluka linky 31", "Line 31 diverted"]], 1795600000, key)
+assert len(board) <= hub.P2P_WIRE_MAX and 3 < kept < 40, (len(board), kept)
+outer = json.loads(zlib.decompress(board))
+assert _verify(pub, outer["p"].encode(), base64.b64decode(outer["s"]))
+stop = json.loads(outer["p"])
+assert stop["k"] == "s" and stop["st"] == "Banská Bystrica, Národná" and stop["n"] == [["Výluka linky 31", "Line 31 diverted"]]
+assert stop["r"][1] == ["31", deps[1]["headsign"][:28], 1795600060, 120] and stop["r"][0][3] is None, stop["r"][:2]
 print("ok p2p packets")
