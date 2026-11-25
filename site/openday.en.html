@@ -15,6 +15,20 @@
 <p>Open the <a href="%WEB_URL%">web version</a> in Safari, tap Share and choose Add to Home Screen. Plan&amp;Ride is then on your home screen like an app, with bus alerts too.</p>
 </section>
 
+<section class="survey" id="anketa">
+<h2>How did you like it?</h2>
+<p>A few questions, it takes a minute. Anonymous: we keep no name or e-mail.</p>
+<form method="post" action="/en/den">
+  <fieldset><legend>What did you like most?</legend><div class="choices"><label><input type="checkbox" name="liked" value="live"> Live departures</label><label><input type="checkbox" name="liked" value="planner"> Journey planner</label><label><input type="checkbox" name="liked" value="follow"> Following a bus</label><label><input type="checkbox" name="liked" value="watch"> Wear OS watch</label><label><input type="checkbox" name="liked" value="tickets"> Ticket and fares</label><label><input type="checkbox" name="liked" value="map"> Bus map</label></div></fieldset>
+  <fieldset><legend>How do you like the app?</legend><div class="choices scale"><label><input type="radio" name="rating" value="1"> 1</label><label><input type="radio" name="rating" value="2"> 2</label><label><input type="radio" name="rating" value="3"> 3</label><label><input type="radio" name="rating" value="4"> 4</label><label><input type="radio" name="rating" value="5"> 5</label></div>
+    <p class="muted small">1 = not at all, 5 = a lot</p></fieldset>
+  <fieldset><legend>Will you get Plan&amp;Ride?</legend><div class="choices"><label><input type="radio" name="download" value="have"> I have it already</label><label><input type="radio" name="download" value="yes"> Yes</label><label><input type="radio" name="download" value="maybe"> Maybe</label><label><input type="radio" name="download" value="no"> No</label></div></fieldset>
+  <fieldset><legend>How often do you go by bus or train?</legend><div class="choices"><label><input type="radio" name="travel" value="daily"> Every day</label><label><input type="radio" name="travel" value="weekly"> A few times a week</label><label><input type="radio" name="travel" value="sometimes"> Now and then</label><label><input type="radio" name="travel" value="rarely"> Hardly ever</label></div></fieldset>
+  <label class="field">What would you add or change?<textarea name="comment" rows="3" maxlength="500"></textarea></label>
+  <button class="btn" type="submit">Send</button>
+</form>
+</section>
+
 <div class="features">
   <div class="card"><h3>Live departures</h3><p>When the bus really comes, delay included.</p></div>
   <div class="card"><h3>Journey planner</h3><p>Buses, city transport and trains across Slovakia, with changes and prices.</p></div>

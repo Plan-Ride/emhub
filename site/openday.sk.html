@@ -15,6 +15,20 @@
 <p>Otvorte <a href="%WEB_URL%">webovú verziu</a> v Safari, ťuknite na Zdieľať a vyberte Pridať na plochu. Plan&amp;Ride potom máte na ploche ako aplikáciu, aj s upozorneniami na autobus.</p>
 </section>
 
+<section class="survey" id="anketa">
+<h2>Ako sa vám páčil?</h2>
+<p>Pár otázok, zaberie to minútu. Anonymne, neukladáme meno ani e-mail.</p>
+<form method="post" action="/den">
+  <fieldset><legend>Čo sa vám páčilo najviac?</legend><div class="choices"><label><input type="checkbox" name="liked" value="live"> Odchody naživo</label><label><input type="checkbox" name="liked" value="planner"> Plánovač ciest</label><label><input type="checkbox" name="liked" value="follow"> Sledovanie autobusu</label><label><input type="checkbox" name="liked" value="watch"> Hodinky s Wear OS</label><label><input type="checkbox" name="liked" value="tickets"> Lístok a ceny</label><label><input type="checkbox" name="liked" value="map"> Mapa autobusov</label></div></fieldset>
+  <fieldset><legend>Ako sa vám aplikácia páči?</legend><div class="choices scale"><label><input type="radio" name="rating" value="1"> 1</label><label><input type="radio" name="rating" value="2"> 2</label><label><input type="radio" name="rating" value="3"> 3</label><label><input type="radio" name="rating" value="4"> 4</label><label><input type="radio" name="rating" value="5"> 5</label></div>
+    <p class="muted small">1 = vôbec, 5 = veľmi</p></fieldset>
+  <fieldset><legend>Stiahnete si Plan&amp;Ride?</legend><div class="choices"><label><input type="radio" name="download" value="have"> Už ho mám</label><label><input type="radio" name="download" value="yes"> Áno</label><label><input type="radio" name="download" value="maybe"> Možno</label><label><input type="radio" name="download" value="no"> Nie</label></div></fieldset>
+  <fieldset><legend>Ako často cestujete autobusom alebo vlakom?</legend><div class="choices"><label><input type="radio" name="travel" value="daily"> Každý deň</label><label><input type="radio" name="travel" value="weekly"> Niekoľkokrát do týždňa</label><label><input type="radio" name="travel" value="sometimes"> Občas</label><label><input type="radio" name="travel" value="rarely"> Takmer nikdy</label></div></fieldset>
+  <label class="field">Čo by ste pridali alebo zmenili?<textarea name="comment" rows="3" maxlength="500"></textarea></label>
+  <button class="btn" type="submit">Odoslať</button>
+</form>
+</section>
+
 <div class="features">
   <div class="card"><h3>Odchody naživo</h3><p>Kedy autobus naozaj príde, aj s meškaním.</p></div>
   <div class="card"><h3>Plánovač ciest</h3><p>Autobusy, mestská doprava aj vlaky po celom Slovensku, s prestupmi a cenou.</p></div>

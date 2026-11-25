@@ -1321,7 +1321,9 @@ class Timetable:
                 out.append({"tripId": f"{trip[0]}:{trip[1]}:{service_day:%Y%m%d}", "line": trip[2], "headsign": trip[3] or self.names[st[-1]],
                             "mode": trip[5], "operator": trip[4], "lat": round(lat, 6), "lon": round(lon, 6),
                             "next": self.names[b], "live": bool(live), "delay": live["delaySeconds"] if live else None,
-                            "source": live.get("source") if live else None, **({"plate": bus[4]} if bus and len(bus) > 4 else {})})
+                            "source": live.get("source") if live else None, **({"plate": bus[4]} if bus and len(bus) > 4 else {}),
+                            # 1.65.0: how the apps name a S.A.D. Zvolen city bus (sadzv line id, trip number), for nearby phones.
+                            **({"sadzv": [city[0], city[2]]} if city else {})})
         return out
 
     def trip_shape(self, trip_id):

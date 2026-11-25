@@ -40,6 +40,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 import statistics
 from collections import deque
 from datetime import date, datetime, timedelta
@@ -58,7 +59,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.63.0"
+VERSION = "1.65.0"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -325,6 +326,16 @@ CREATE TABLE IF NOT EXISTS bugs (
   device TEXT NOT NULL DEFAULT '',
   logs TEXT NOT NULL DEFAULT '',
   consent_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS openday_answers (
+  id INTEGER PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  lang TEXT NOT NULL,
+  liked TEXT NOT NULL DEFAULT '',
+  download TEXT NOT NULL DEFAULT '',
+  travel TEXT NOT NULL DEFAULT '',
+  rating INTEGER,
+  comment TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS submission_images (
   id INTEGER PRIMARY KEY,
@@ -1487,6 +1498,170 @@ def demo_qr_scan():
     demo_write(lambda saved: saved["stats"].setdefault(day, {}).update(qr=saved["stats"].get(day, {}).get("qr", 0) + 1))
 
 
+# ------------------------------------------------------------------ 1.65.0: delays for phones without data, signed
+
+# Phones with data fetch a packet of the live buses around them and broadcast it (Bluetooth LE, Google Nearby); phones
+# without data only listen. emHUB signs each packet (ECDSA P-256, SHA-256) and the app checks it with the public key it
+# carries, so a phone can't pass on made-up delays. Pure Python: the server has no crypto library, and Android verifies
+# P-256 on every version (Ed25519 only from Android 13).
+_P256 = (0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff,
+         0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551,
+         (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
+          0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5))
+P2P_KEY_PATH = Path(ENV("HUB_P2P_KEY", str(Path(DB_PATH).parent / "p2p-key")))
+P2P_BOX = (0.05, 0.07)        # degrees around the phone: ~5.5 km each way
+P2P_WIRE_MAX = 500            # bytes: one Bluetooth LE read (an attribute holds 512)
+_p2p_cache, _p2p_lock = {}, threading.Lock()
+
+
+def _ec_add(a, b):
+    p = _P256[0]
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % p == 0:
+        return None
+    m = (3 * a[0] * a[0] - 3) * pow(2 * a[1], -1, p) if a == b else (b[1] - a[1]) * pow(b[0] - a[0], -1, p)
+    x = (m * m - a[0] - b[0]) % p
+    return x, (m * (a[0] - x) - a[1]) % p
+
+
+def _ec_mul(k, point):
+    out = None
+    while k:
+        if k & 1:
+            out = _ec_add(out, point)
+        point, k = _ec_add(point, point), k >> 1
+    return out
+
+
+def p2p_key():
+    """The signing key (made once, kept beside the database, readable only by emHUB)."""
+    if not P2P_KEY_PATH.exists():
+        P2P_KEY_PATH.write_text(f"{secrets.randbelow(_P256[1] - 1) + 1:x}\n")
+        os.chmod(P2P_KEY_PATH, 0o600)
+    return int(P2P_KEY_PATH.read_text().strip(), 16)
+
+
+def p2p_public_der(d):
+    """The public key as X.509 SubjectPublicKeyInfo (what Android's KeyFactory reads), DER."""
+    x, y = _ec_mul(d, _P256[2])
+    return bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200") + b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+
+
+def _der_int(v):
+    b = v.to_bytes(33, "big").lstrip(b"\x00")
+    b = b"\x00" + b if b[0] & 0x80 else b
+    return b"\x02" + bytes([len(b)]) + b
+
+
+def p2p_sign(d, message):
+    """ECDSA over SHA-256, DER-encoded (Java's SHA256withECDSA)."""
+    n = _P256[1]
+    z = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    while True:
+        k = secrets.randbelow(n - 1) + 1
+        r = _ec_mul(k, _P256[2])[0] % n
+        s = pow(k, -1, n) * (z + r * d) % n
+        if r and s:
+            break
+    body = _der_int(r) + _der_int(s)
+    return b"\x30" + bytes([len(body)]) + body
+
+
+def p2p_wire(vehicles, at, d, lat, lon):
+    """
+    What a phone broadcasts: deflate(JSON {"p": payload, "s": base64 signature}), the payload
+    {"v": 1, "at": epoch s, "b": [[hub trip id, sadzv line id, sadzv trip number, delay s]]}: the live buses nearest the
+    phone, as many as fit in one Bluetooth LE read. Nothing about the phone that asked is in it.
+    """
+    live = sorted((v for v in vehicles if v.get("delay") is not None),
+                  key=lambda v: (v["lat"] - lat) ** 2 + ((v["lon"] - lon) * 0.66) ** 2)
+    rows = [[v["tripId"], *(v.get("sadzv") or [0, 0]), int(v["delay"])] for v in live]
+    while True:
+        payload = json.dumps({"v": 1, "at": at, "b": rows}, separators=(",", ":"))
+        wire = zlib.compress(json.dumps({"p": payload, "s": base64.b64encode(p2p_sign(d, payload.encode())).decode()},
+                                        separators=(",", ":")).encode(), 9)
+        if len(wire) <= P2P_WIRE_MAX or not rows:
+            return wire, len(rows)
+        rows = rows[:max(0, min(len(rows) - 1, len(rows) * P2P_WIRE_MAX // len(wire)))]
+
+
+def p2p_pack(lat, lon):
+    """The signed packet for a place, kept 30 s per ~1 km square (phones ask every minute)."""
+    cell = (round(lat, 2), round(lon, 2))
+    with _p2p_lock:
+        hit = _p2p_cache.get(cell)
+        if hit and time.time() - hit[0] < 30:
+            return hit[1]
+    t = timetable.current
+    if t is None:
+        return None
+    box = (lat - P2P_BOX[0], lon - P2P_BOX[1], lat + P2P_BOX[0], lon + P2P_BOX[1])
+    with db() as conn:
+        reported = {r[0] for r in conn.execute("SELECT DISTINCT trip_key FROM community_reports WHERE created_at>=?",
+                                               (now() - COMMUNITY_WINDOW_S,))}
+
+        def delay_of(keys):
+            return next((x for x in (trip_delay(conn, k) for k in keys if k in reported) if x), None)
+        vehicles = t.vehicles(int(time.time()), box, delay_of, sadzv.vehicles())
+    wire, count = p2p_wire(vehicles, now(), p2p_key(), lat, lon)
+    out = {"wire": base64.b64encode(wire).decode(), "buses": count, "at": now()}
+    with _p2p_lock:
+        _p2p_cache[cell] = (time.time(), out)
+        for old in [c for c, (at, _) in _p2p_cache.items() if time.time() - at > 120]:
+            del _p2p_cache[old]
+    return out
+
+
+# 1.64.0: the open day page's questionnaire (anonymous: no name, e-mail or address is kept).
+SURVEY = {"liked": ("live", "planner", "follow", "watch", "tickets", "map"),
+          "download": ("have", "yes", "maybe", "no"),
+          "travel": ("daily", "weekly", "sometimes", "rarely")}
+SURVEY_THANKS = {
+    "sk": '<section><h1>Ďakujeme!</h1><p class="lead">Vaše odpovede nám pomôžu Plan&amp;Ride zlepšiť.</p><div class="actions">'
+          '<a class="btn" href="https://play.google.com/store/apps/details?id=com.ksjd.testem&amp;hl=sk">Stiahnuť z Google Play</a>'
+          '<a class="btn quiet" href="%WEB_URL%">Otvoriť v prehliadači</a></div></section>',
+    "en": '<section><h1>Thank you!</h1><p class="lead">Your answers help us make Plan&amp;Ride better.</p><div class="actions">'
+          '<a class="btn" href="https://play.google.com/store/apps/details?id=com.ksjd.testem&amp;hl=en">Get it on Google Play</a>'
+          '<a class="btn quiet" href="%WEB_URL%">Open in the browser</a></div></section>',
+}
+
+
+def survey_answer(form, lang):
+    """One filled-in questionnaire (form: parse_qs lists); unknown choices are dropped. False when nothing was answered."""
+    one = lambda key: next((v for v in form.get(key, []) if v in SURVEY[key]), "")  # noqa: E731
+    liked = ",".join(v for v in SURVEY["liked"] if v in form.get("liked", []))
+    rating = next((int(v) for v in form.get("rating", []) if v in ("1", "2", "3", "4", "5")), None)
+    comment = clean(" ".join(form.get("comment", [""])[:1]), 500)
+    row = (liked, one("download"), one("travel"), rating, comment)
+    if not any(row):
+        return False
+    with db() as conn:
+        conn.execute("INSERT INTO openday_answers(created_at, lang, liked, download, travel, rating, comment) VALUES (?,?,?,?,?,?,?)",
+                     (now(), lang, *row))
+    return True
+
+
+def survey_summary():
+    """Counts of every answer, today's number, the average rating and the newest comments, for the Demo tab."""
+    day_start = int(datetime.now(LOCAL_ZONE).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM openday_answers ORDER BY id DESC").fetchall()
+    counts = {key: dict.fromkeys(values, 0) for key, values in SURVEY.items()}
+    for r in rows:
+        for v in filter(None, r["liked"].split(",")):
+            counts["liked"][v] = counts["liked"].get(v, 0) + 1
+        for key in ("download", "travel"):
+            if r[key]:
+                counts[key][r[key]] += 1
+    ratings = [r["rating"] for r in rows if r["rating"]]
+    return {"total": len(rows), "today": sum(r["created_at"] >= day_start for r in rows), "counts": counts,
+            "rating": round(sum(ratings) / len(ratings), 1) if ratings else None, "ratings": len(ratings),
+            "comments": [{"at": r["created_at"], "text": r["comment"], "lang": r["lang"]} for r in rows if r["comment"]][:50]}
+
+
 # ------------------------------------------------------------------ settings
 
 _settings = {}
@@ -1573,7 +1748,7 @@ def now():
 # admins only. Changing the website too: its pages run scripts on the dashboard's own address, so anyone who could edit
 # them could act as the next admin who opens the site.
 TABS = ("bugs", "ideas", "submissions", "lines", "releases", "notices", "community", "timetable", "map", "fleet", "site", "server",
-        "mail")
+        "demo", "mail")
 ADMIN_WRITE_TABS = ("site",)
 # People's own correspondence: the read-only role doesn't include it, only a ticked box (or admin) does.
 PRIVATE_TABS = ("mail",)
@@ -1738,6 +1913,8 @@ submission_limiter = RateLimiter(20, 60 * 60)  # per IP: missing stops and conne
 eta_limiter = RateLimiter(30, 60 * 60)  # shared arrival links per IP an hour
 report_limiter = RateLimiter(1200, 60 * 60)  # per IP: phones on mobile data share addresses
 reporter_limiter = RateLimiter(300, 60 * 60)  # per rider: GPS every 15 s is 240 an hour
+survey_limiter = RateLimiter(300, 60 * 60)  # per IP: a school's visitors share one address
+p2p_limiter = RateLimiter(240, 60 * 60)  # per IP: a sharing phone asks once a minute; phones on mobile data share addresses
 timetable_limiter = RateLimiter(2000, 60 * 60)  # per IP: a planner search is a few requests
 share_limiter = RateLimiter(30, 60 * 60)  # per IP: new share codes
 claim_limiter = RateLimiter(12, 15 * 60)  # per IP: codes tried (6 digits: guessing one takes ~40 000 windows)
@@ -3362,6 +3539,13 @@ class Handler(BaseHTTPRequestHandler):
         page = site_route(path)
         if method == "GET" and page and page[0] == "openday" and query.get("z") == "qr":
             demo_qr_scan()
+        if method == "POST" and page and page[0] == "openday":
+            if not survey_limiter.allow(self.client_ip()):
+                return self.error(429, "Too many requests")
+            form = urllib.parse.parse_qs(self.read_body(10_000).decode(errors="replace"))
+            if not survey_answer(form, page[1]):
+                return self.send(303, b"", headers={"Location": site_url("openday", page[1])})
+            return self.send(200, render_site(*page, content=SURVEY_THANKS[page[1]]), "text/html")
         if method == "GET" and page:
             return self.send(200, render_site(*page), "text/html")
         if method == "GET" and path == "/robots.txt":
@@ -3577,6 +3761,20 @@ class Handler(BaseHTTPRequestHandler):
             status, body = timetable_query(route[len("timetable/"):], query)
             count_search(route[len("timetable/"):], query, status, body)
             return self.send(status, body, headers=self.cors())
+        if method == "GET" and route == "p2p/pack":
+            # 1.65.0: the signed packet a phone with data broadcasts to phones without (see p2p_wire).
+            if not p2p_limiter.allow(self.client_ip()):
+                return self.error(429, "Too many requests", cors=True)
+            try:
+                lat, lon = float(query.get("lat") or ""), float(query.get("lon") or "")
+            except ValueError:
+                lat = lon = 0.0
+            if not (47 < lat < 50 and 16.5 < lon < 23):
+                return self.error(400, "lat and lon in Slovakia", cors=True)
+            pack = p2p_pack(round(lat, 3), round(lon, 3))
+            return self.send(200, pack, headers=self.cors()) if pack else self.error(503, "Timetable not loaded", cors=True)
+        if method == "GET" and route == "p2p/key":
+            return self.send(200, {"key": base64.b64encode(p2p_public_der(p2p_key())).decode()}, headers=self.cors())
         if route.startswith("shares"):
             return self.share_api(method, route, query)
         if method == "POST" and route == "bugs":
@@ -4006,7 +4204,7 @@ class Handler(BaseHTTPRequestHandler):
             return ("mail",)
         tab = {"timetable": "timetable", "feeds": "timetable", "map": "map", "stops": "map", "lines": "lines", "links": "lines",
                "submissions": "submissions", "releases": "releases", "notices": "notices", "community": "community",
-               "site": "site", "server": "server", "demo": "server"}.get(top)
+               "site": "site", "server": "server", "demo": "demo"}.get(top)
         return (tab,) if tab else None
 
     def bug_tab(self, bug_id):
@@ -4298,7 +4496,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, dict(demo_for(saved, ""), mode=saved["mode"], hold=saved["hold"], devices=devices, pin=saved["pin"],
                                        apk=saved["apk"], kiosk=saved["kiosk"], locked=saved["locked"],
                                        groups=sorted({v.get("group") for v in saved["devices"].values() if v.get("group")}),
-                                       stats=saved["stats"].get(day, {}),
+                                       stats=saved["stats"].get(day, {}), survey=survey_summary(),
                                        visits=sum(v[0] for v in today.values()), visitSeconds=sum(v[1] for v in today.values())))
         if method == "POST" and route == "demo/apk":
             # The demo build, base64 in JSON (the admin API takes JSON only); ~5 MB.
@@ -5327,7 +5525,13 @@ def server_health():
         pass
     disk = shutil.disk_usage(Path(DB_PATH).parent)
     out["disk"] = {"total": disk.total, "free": disk.free}
-    out["dbSize"] = sum(p.stat().st_size for p in Path(DB_PATH).parent.glob(Path(DB_PATH).name + "*"))
+    # The -wal and -shm files come and go (a checkpoint, a restart): one gone between listing and measuring is 0.
+    def size(p):
+        try:
+            return os.stat(p).st_size
+        except FileNotFoundError:
+            return 0
+    out["dbSize"] = sum(size(DB_PATH + end) for end in ("", "-wal", "-shm"))
     out["routes"] = sorted(({"route": k, "count": c, "avgMs": round(t / c), "sendMs": round(w / c), "maxMs": round(m)} for k, (c, t, m, w) in list(timings.items())),
                            key=lambda x: -x["count"])
     out["errors"] = list(recent_errors)

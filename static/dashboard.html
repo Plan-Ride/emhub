@@ -412,6 +412,7 @@
     <a href="#map" data-nav="map">Map</a>
     <a href="#fleet" data-nav="fleet">Fleet</a>
     <a href="#site" data-nav="site">Website</a>
+    <a href="#demo" data-nav="demo">Demo</a>
     <a href="#server" data-nav="server">Server</a>
     <a href="#settings" data-nav="settings">Settings</a>
     <p id="view-only" class="muted small" hidden style="margin:8px 0 0">View only: your account can't change this page.</p>
@@ -515,6 +516,7 @@ async function route() {
     if (page === "activity") return await renderActivity();
     if (page === "fares") return await renderFares();
     if (page === "server") return await renderServer();
+    if (page === "demo") return renderDemoPage();
     if (page === "timetable") return await renderTimetable();
     if (page === "map") return renderMap(arg ? decodeURIComponent(arg) : null);
     if (page === "fleet") return await renderFleet();
@@ -1094,7 +1096,6 @@ async function renderServer() {
         <div class="stat"><b class="${diskUsed > 0.9 ? "warn-text" : ""}">${bytes(h.disk.free)}</b><span>disk free, database ${bytes(h.dbSize)}</span></div>
       </div>
     </div>
-    <div class="section" id="demo-phones"></div>
     <div class="section">
       <div class="row" style="justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px"><h2>Database backups</h2>
         <button class="btn" type="button" id="backup-now">Back up now</button></div>
@@ -1125,7 +1126,6 @@ async function renderServer() {
         <tbody>${h.reportedVersions.map((v) => `<tr><td data-label="In reports">${esc(v.version)}</td><td data-label="Platform">${esc(v.platform)}</td>
           <td data-label="Reports">${v.reports}</td><td data-label="Last">${ago(v.last)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No reports yet.</p>`}
     </div>`;
-  renderDemo();
   $("#backup-now").onclick = async (e) => {
     e.target.disabled = true;
     try { const r = await api("server/backup", {}); toast("Backed up: " + r.name); renderServer(); }
@@ -1135,12 +1135,45 @@ async function renderServer() {
 
 // ------------------------------------------------------------------ open day demo phones (the app's demo build)
 
+/** 1.64.0: the open day's own tab: the phones and what visitors answered on the QR code's page. */
+function renderDemoPage() {
+  view.innerHTML = `<div class="page-head"><h1>Demo</h1></div>
+    <div class="section" id="demo-phones"></div>
+    <div class="section" id="demo-survey"></div>`;
+  renderDemo();
+}
+
+/** The questionnaire on the open day page (/den): how many answered, and each answer's count. */
+function renderSurvey(s) {
+  const box = $("#demo-survey");
+  if (!box || !s) return;
+  const names = {
+    liked: { live: "Live departures", planner: "Journey planner", follow: "Following a bus", watch: "Wear OS watch", tickets: "Ticket and fares", map: "Bus map" },
+    download: { have: "Have it already", yes: "Yes", maybe: "Maybe", no: "No" },
+    travel: { daily: "Every day", weekly: "A few times a week", sometimes: "Now and then", rarely: "Hardly ever" },
+  };
+  const bars = (key, title) => {
+    const entries = Object.entries(s.counts[key]), most = Math.max(1, ...entries.map(([, n]) => n));
+    return `<div><h3 style="margin:0 0 8px">${title}</h3>${entries.sort((a, b) => b[1] - a[1]).map(([k, n]) => `
+      <div class="row" style="gap:8px;align-items:center;margin:4px 0"><span style="width:150px">${esc(names[key][k] || k)}</span>
+        <span style="height:10px;border-radius:5px;background:var(--accent, #2C4A3B);width:${Math.round((n / most) * 160)}px;min-width:2px"></span><b>${n}</b></div>`).join("")}</div>`;
+  };
+  box.innerHTML = `<h2>Questionnaire</h2>
+    <p class="muted" style="max-width:72ch;margin:0 0 12px">On the page the phones' QR code opens (<a href="/den" target="_blank" rel="noopener">/den</a>). Anonymous.
+      ${s.total} ${s.total === 1 ? "answer" : "answers"}, ${s.today} today${s.rating != null ? `; rated ${s.rating} of 5 on average (${s.ratings})` : ""}.</p>
+    ${s.total ? `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px">
+      ${bars("liked", "Liked most")}${bars("download", "Will get the app")}${bars("travel", "Goes by bus or train")}</div>
+    <h3 style="margin:20px 0 8px">What they would add or change</h3>
+    ${s.comments.length ? s.comments.map((c) => `<p style="max-width:72ch;margin:0 0 8px">${esc(c.text)} <span class="muted small">${ago(c.at)}, ${esc(c.lang)}</span></p>`).join("") : `<p class="muted">Nothing yet.</p>`}` : ""}`;
+}
+
 /** The demo phones: what all of them show (one shared tour clock), groups and each one's own choice, kiosk and lock, updates. Updates every 5 s. */
 async function renderDemo() {
   const box = $("#demo-phones");
   if (!box) return;
   let d;
   try { d = await api("demo"); } catch (err) { box.innerHTML = `<h2>Demo phones</h2><p class="muted">${esc(err.message)}</p>`; return; }
+  renderSurvey(d.survey);
   // The steps the phones offer (each a step a phone can start at; the ones that need it go with it).
   const steps = [];
   for (const dev of d.devices) for (const [id, label] of dev.steps || []) if (!steps.some((s) => s[0] === id)) steps.push([id, label]);
@@ -2973,7 +3006,7 @@ function showInviteLink(r, who) {
 }
 
 const TAB_NAMES = { bugs: "Bugs", ideas: "Suggestions", submissions: "Submissions", lines: "Lines", releases: "Releases", notices: "Notices",
-  community: "Community", timetable: "Timetable", map: "Map", fleet: "Fleet", site: "Website", server: "Server", mail: "Mail" };
+  community: "Community", timetable: "Timetable", map: "Map", fleet: "Fleet", site: "Website", server: "Server", demo: "Demo", mail: "Mail" };
 
 function accessText(a) {
   if (a.role !== "custom") return a.role === "admin" ? "Admin" : "Read-only";

@@ -1,5 +1,8 @@
 """Run: python3 test_hub.py (uses a throwaway database)."""
+import base64
 import datetime
+import hashlib
+import zlib
 import http.client
 import json
 import math
@@ -358,6 +361,17 @@ for name in hub.SITE_PAGES:
         assert call(hub.site_url(name, lang))[0] == 200
         assert f'<link rel="canonical" href="{url}">' in call(hub.site_url(name, lang))[2].decode()
 assert f'rel="canonical" href="{hub.PUBLIC_URL}/en/"' in call("/en")[2].decode()
+# 1.64.0: the open day questionnaire: anonymous, unknown choices dropped, an empty form saves nothing.
+assert b'name="liked"' in call("/den")[2] and b'action="/en/den"' in call("/en/den")[2]
+body = urllib.parse.urlencode([("liked", "planner"), ("liked", "follow"), ("liked", "evil"), ("rating", "5"), ("download", "yes"),
+                               ("travel", "x"), ("comment", "<b>more trains</b>")]).encode()
+status, _, page = opener.open(urllib.request.Request(base + "/den", data=body)).status, None, None
+assert status == 200
+assert call("/den", {}, form=True)[0] == 303
+s = hub.survey_summary()
+assert s["total"] == 1 and s["counts"]["liked"]["planner"] == 1 and "evil" not in s["counts"]["liked"] and s["rating"] == 5, s
+assert s["counts"]["download"]["yes"] == 1 and sum(s["counts"]["travel"].values()) == 0 and s["comments"][0]["text"] == "<b>more trains</b>"
+assert json.loads(call("/admin/api/demo", cookie=cookie)[2])["survey"]["total"] == 1
 assert call("/login")[1]["X-Robots-Tag"] == "noindex" and call("/invite")[1]["X-Robots-Tag"] == "noindex"
 assert "X-Robots-Tag" not in call("/")[1]
 # A shared bus goes on to the web version; anything but a plain token doesn't.
@@ -1573,3 +1587,31 @@ for bad in (movie + b"<html>", movie[:-3], b"\0\0\0\x10mdat" + b"x" * 8):
     except ValueError:
         pass
 print("ok bug video")
+
+# ---- 1.65.0: signed packets for phones without data
+def _verify(pub_der, message, sig):
+    """ECDSA P-256 check (what the app does with Java's SHA256withECDSA)."""
+    n, G = hub._P256[1], hub._P256[2]
+    q = (int.from_bytes(pub_der[-64:-32], "big"), int.from_bytes(pub_der[-32:], "big"))
+    assert sig[0] == 0x30 and sig[2] == 0x02
+    lr = sig[3]
+    r = int.from_bytes(sig[4:4 + lr], "big")
+    s = int.from_bytes(sig[6 + lr:6 + lr + sig[5 + lr]], "big")
+    z = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    w = pow(s, -1, n)
+    x = hub._ec_add(hub._ec_mul(z * w % n, G), hub._ec_mul(r * w % n, q))[0]
+    return x % n == r
+
+
+key = 0x5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed
+pub = hub.p2p_public_der(key)
+assert len(pub) == 91 and _verify(pub, b"hello", hub.p2p_sign(key, b"hello")) and not _verify(pub, b"hellO", hub.p2p_sign(key, b"hello"))
+near = [{"tripId": f"sadzv:{i}:20261125", "lat": 48.7 + i / 1000, "lon": 19.1, "delay": 60 * i, "sadzv": [700 + i, i]} for i in range(200)]
+wire, count = hub.p2p_wire(near + [{"tripId": "x", "lat": 48.7, "lon": 19.1, "delay": None}], 1795600000, key, 48.7, 19.1)
+assert len(wire) <= hub.P2P_WIRE_MAX and 5 < count < 200, (len(wire), count)
+outer = json.loads(zlib.decompress(wire))
+assert _verify(pub, outer["p"].encode(), base64.b64decode(outer["s"]))
+payload = json.loads(outer["p"])
+assert payload["v"] == 1 and payload["at"] == 1795600000 and payload["b"][0] == ["sadzv:0:20261125", 700, 0, 0], payload["b"][:2]
+assert all(row[0] != "x" for row in payload["b"]), "only buses with a known delay"
+print("ok p2p packets")
