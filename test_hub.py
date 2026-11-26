@@ -553,6 +553,18 @@ assert tc.plan(tc.resolve("town namestie x"), tc.resolve("town park"), sat, 1) =
 x = tc.resolve("town namestie x")
 assert [(d["line"], hm(d["at"])) for d in tc.departures([x], at("06:00"), 5)][0] == ("9", "30 07:00")
 assert tc.departures([x], at("06:00"), 5, {"sad-zvolen-as"}) == [], "the apps show SAD Zvolen live instead"
+# EM-0134: DPMBB's trips fill in day by day what sadzv's day misses: its 7:00 line 9 is there on Tuesday, gone on Wednesday.
+wed_day = {"date": "2026-09-30", "platforms": city_day["platforms"],
+           "trips": [{"lineId": 78, "line": "8", "route": "8001", "trip": 1, "headsign": "Zvolen, Park", "stops": [[501, 28800], [502, 29400]]}]}
+dpmbb = {"operator": "DPMBB", "trips": [{"line": "9", "trip": 1, "days": [0, 1, 2, 3, 4], "stops": [["Námestie X", 25200], ["Park", 25800]]}]}
+tb = timetable.Timetable({"a": os.path.join(folder, "a.zip"), "b": os.path.join(folder, "b.zip")}, today=datetime.date(2026, 9, 29),
+                         city=[city_day, wed_day], dpmbb=dpmbb)
+x = tb.resolve("town namestie x")
+def line9(day):
+    t0 = int(datetime.datetime(2026, 9, day, 6, 50, tzinfo=timetable.ZONE).timestamp())
+    return [(d["feed"], hm(d["at"])) for d in tb.departures([x], t0, 10) if d["line"] == "9" and hm(d["at"]).startswith(str(day))]
+assert line9(29) == [(timetable.CITY_FEED, "29 07:00")], line9(29)
+assert line9(30) == [(timetable.DPMBB_FEED, "30 07:00")], "missing from Wednesday's sadzv: DPMBB's trip stands in"
 # A city way's stops set in the map editor: an added stop is timed by distance between the trip's own stops.
 mid = tc.by_id.get("town as")
 if mid is not None:

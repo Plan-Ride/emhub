@@ -59,7 +59,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.65.1"
+VERSION = "1.65.2"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 

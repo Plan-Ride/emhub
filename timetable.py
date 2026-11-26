@@ -398,7 +398,10 @@ class Timetable:
         """
         Banská Bystrica's lines 1-8 as DPMBB publishes them (dpmbb.json): sadzv has only
         part of their trips (trolleybus 6 at 7:38 from Štadlerovo nábrežie was missing, submission 5). A trip sadzv
-        already has (same line, half its stops at the same times, same kind of day) is left to sadzv, whose buses are live.
+        already has on that day (same line, half its stops at the same times) is left to sadzv, whose buses are live.
+        EM-0134: day by day, not by kind of day: sadzv's list misses different trips each day (line 1 at Plážové
+        kúpalisko had 7 trips 11:00-12:10 on 25.11. and 2 on 26.11.), and a trip sadzv had on one workday was dropped
+        from all of them, so the 11:37 trolleybus was in neither and its stops couldn't be shown.
         """
         if not data:
             return
@@ -421,13 +424,12 @@ class Timetable:
             by_name[key(name)] = s
             return s
 
-        def kind(n):
-            return max((self.first_day + timedelta(days=n)).weekday(), 4)  # 4 workday, 5 Saturday, 6 Sunday
-        have = set()
+        have = set()  # (line, station, second of the day, day number): what sadzv has on each day
         for t in self.trips:
             if t[0] == CITY_FEED:
-                for k in {kind(n) for n in self.services.get(t[6], ())}:
-                    have.update((t[2], s, secs % 86400, k) for s, secs in zip(t[7], t[9]))
+                stops = [(t[2], s, secs % 86400) for s, secs in zip(t[7], t[9])]
+                for n in self.services.get(t[6], ()):
+                    have.update(x + (n,) for x in stops)
         added = same = 0
         missing = set()
         for x in data.get("trips", []):
@@ -440,20 +442,19 @@ class Timetable:
                     rows.append((s, secs))
             if len(rows) < 2:
                 continue
-            # Kind by kind of day (a weekend trip sadzv has on Sunday may still be missing on Saturday). At least half its
-            # stops at the same times: two shared stops alone were another trip (22:39 at Štadlerovo nábrežie).
-            days = set(x["days"])
-            for k in {max(d, 4) for d in x["days"]}:
-                if sum((x["line"], s, secs % 86400, k) in have for s, secs in rows) >= max(2, len(rows) // 2):
-                    days -= {0, 1, 2, 3, 4} if k == 4 else {k}
-            if not days:
+            # Day by day: the days it runs, less those sadzv has it on. At least half its stops at the same times: two
+            # shared stops alone were another trip (22:39 at Štadlerovo nábrežie).
+            start = x.get("validFrom") or "0000-00-00"
+            enough = max(2, len(rows) // 2)
+            runs = {n for n in range(DAYS_BACK + DAYS_AHEAD + 1)
+                    if (self.first_day + timedelta(days=n)).weekday() in set(x["days"])
+                    and (self.first_day + timedelta(days=n)).isoformat() >= start
+                    and sum((x["line"], s, secs % 86400, n) in have for s, secs in rows) < enough}
+            if not runs:
                 same += 1
                 continue
             service = (DPMBB_FEED, f'{x["line"]}-{x["trip"]}')
-            start = x.get("validFrom") or "0000-00-00"
-            self.services[service] = {n for n in range(DAYS_BACK + DAYS_AHEAD + 1)
-                                      if (self.first_day + timedelta(days=n)).weekday() in days
-                                      and (self.first_day + timedelta(days=n)).isoformat() >= start}
+            self.services[service] = runs
             trip_id = f'{x["line"]}-{x["trip"]}'
             self.trip_index[(DPMBB_FEED, trip_id)] = len(self.trips)
             times = tuple(secs for _, secs in rows)
