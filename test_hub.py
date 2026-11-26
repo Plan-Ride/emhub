@@ -1639,4 +1639,7 @@ assert _verify(pub, outer["p"].encode(), base64.b64decode(outer["s"]))
 stop = json.loads(outer["p"])
 assert stop["k"] == "s" and stop["st"] == "Banská Bystrica, Národná" and stop["n"] == [["Výluka linky 31", "Line 31 diverted"]]
 assert stop["r"][1] == ["31", deps[1]["headsign"][:28], 1795600060, 120, "t1", 1] and stop["r"][0][3] is None, stop["r"][:2]
+assert hub.p2p_hash("banska bystrica plazove kupalisko") == 0x234534, hex(hub.p2p_hash("banska bystrica plazove kupalisko"))  # = the app's
+board, _ = hub.p2p_board_wire("Zvolen, AS", deps[:2], {}, [], 1795600000, key, "zvolen as")
+assert json.loads(json.loads(zlib.decompress(board))["p"])["sid"] == "zvolen as", "an asked stop's board says which it is"
 print("ok p2p packets")

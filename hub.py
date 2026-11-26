@@ -59,7 +59,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.65.2"
+VERSION = "1.66.0"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -1595,7 +1595,33 @@ def p2p_wire(vehicles, at, d, lat, lon, crowd_of=lambda keys: 0):
     return p2p_signed(d, {"v": 1, "k": "b", "at": at}, rows)
 
 
-def p2p_board_wire(station, departures, delays, notices, at, d):
+def p2p_hash(station_id):
+    """
+    2.19.0: a stop as a phone without data asks for it over Bluetooth: 24 bits of FNV-1a over emHUB's station id (the
+    id the offline timetables carry). Three fit in one Bluetooth advertisement; a rare clash goes to the nearest stop.
+    """
+    h = 0x811C9DC5
+    for b in str(station_id).encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h & 0xFFFFFF
+
+
+_p2p_hashes = (None, {})  # (timetable, {hash: [station index]})
+
+
+def p2p_stations(t, h):
+    """The stations a question's code stands for, in the timetable [t] (worked out once per timetable)."""
+    global _p2p_hashes
+    with _p2p_lock:
+        if _p2p_hashes[0] is not t:
+            table = {}
+            for s, sid in enumerate(t.station_ids):
+                table.setdefault(p2p_hash(sid), []).append(s)
+            _p2p_hashes = (t, table)
+        return _p2p_hashes[1].get(h, [])
+
+
+def p2p_board_wire(station, departures, delays, notices, at, d, station_id=""):
     """
     The stop packet {"v": 1, "k": "s", "at", "st": stop name, "n": [[notice sk, notice en]], "r": [[line, headsign,
     leaves epoch s, delay s or null, hub trip id, its stop number here]]}: the next departures from the stop nearest the
@@ -1603,7 +1629,8 @@ def p2p_board_wire(station, departures, delays, notices, at, d):
     and stop number let a phone without data follow the bus (its stops from the offline timetables until it has data).
     """
     rows = [[x["line"], x["headsign"][:28], x["at"] // 1000, delays.get(x["tripId"]), x["tripId"], x.get("seq", 0)] for x in departures]
-    return p2p_signed(d, {"v": 1, "k": "s", "at": at, "st": station, "n": notices}, rows)
+    # "sid": which stop it is, so a phone that asked for it (by its code) knows this is its answer.
+    return p2p_signed(d, {"v": 1, "k": "s", "at": at, "st": station, "sid": station_id, "n": notices}, rows)
 
 
 def p2p_notices(conn, station, lines):
@@ -1614,6 +1641,44 @@ def p2p_notices(conn, station, lines):
         if for_here:
             out.append([(n["title_sk"] or "")[:90], (n["title_en"] or n["title_sk"] or "")[:90]])
     return out[:2]
+
+
+def p2p_board_for(t, s, delays):
+    """A station's signed board (next departures, live delays known, notices), kept 30 s per station."""
+    key = ("stop", t.station_ids[s])
+    with _p2p_lock:
+        hit = _p2p_cache.get(key)
+        if hit and time.time() - hit[0] < 30:
+            return hit[1]
+    departures = t.departures([s], int(time.time()), limit=14, groups=timetable.GROUPS)
+    with db() as conn:
+        notices = p2p_notices(conn, t.names[s], {x["line"] for x in departures})
+    board = p2p_board_wire(t.names[s], departures, delays, notices, now(), p2p_key(), t.station_ids[s])[0]
+    with _p2p_lock:
+        _p2p_cache[key] = (time.time(), board)
+    return board
+
+
+def p2p_asked(codes, lat, lon):
+    """
+    2.19.0: the boards a phone with data broadcasts for questions it heard ("departures from these stops", by code): each
+    code's station nearest to the phone, within 60 km. The live delays come from the buses around the phone.
+    """
+    t = timetable.current
+    if t is None:
+        return None
+    pack = p2p_pack(lat, lon)  # the buses around (cached): their delays go on the boards
+    cell = (round(lat, 2), round(lon, 2))
+    with _p2p_lock:
+        hit = _p2p_cache.get(cell)
+    delays = hit[1][2] if hit else {}
+    boards = []
+    for code in codes[:3]:
+        near = [(timetable.meters(lat, lon, t.lat[s], t.lon[s]), s) for s in p2p_stations(t, code) if t.lat[s] is not None]
+        near = [x for x in near if x[0] <= 60_000]
+        if near:
+            boards.append(base64.b64encode(p2p_board_for(t, min(near)[1], delays)).decode())
+    return {"boards": boards, "at": now(), "nearby": pack is not None}
 
 
 def p2p_pack(lat, lon):
@@ -1654,14 +1719,7 @@ def p2p_pack(lat, lon):
         with _p2p_lock:
             hit = _p2p_cache.get(key)
             board = hit[1] if hit and time.time() - hit[0] < 30 else None
-        if board is None:
-            departures = t.departures([t.by_id[stop["id"]]], int(time.time()), limit=14, groups=timetable.GROUPS)
-            with db() as conn:
-                notices = p2p_notices(conn, stop["name"], {x["line"] for x in departures})
-            board = p2p_board_wire(stop["name"], departures, delays, notices, now(), p2p_key())[0]
-            with _p2p_lock:
-                _p2p_cache[key] = (time.time(), board)
-        out["board"] = base64.b64encode(board).decode()
+        out["board"] = base64.b64encode(p2p_board_for(t, t.by_id[stop["id"]], delays)).decode()
     with _p2p_lock:
         for old in [c for c, (at, _) in _p2p_cache.items() if time.time() - at > 120]:
             del _p2p_cache[old]
@@ -1967,6 +2025,7 @@ eta_limiter = RateLimiter(30, 60 * 60)  # shared arrival links per IP an hour
 report_limiter = RateLimiter(1200, 60 * 60)  # per IP: phones on mobile data share addresses
 reporter_limiter = RateLimiter(300, 60 * 60)  # per rider: GPS every 15 s is 240 an hour
 survey_limiter = RateLimiter(300, 60 * 60)  # per IP: a school's visitors share one address
+p2p_ask_limiter = RateLimiter(240, 60 * 60)  # per IP: questions heard (each with its cover questions)
 p2p_limiter = RateLimiter(240, 60 * 60)  # per IP: a sharing phone asks once a minute; phones on mobile data share addresses
 timetable_limiter = RateLimiter(2000, 60 * 60)  # per IP: a planner search is a few requests
 share_limiter = RateLimiter(30, 60 * 60)  # per IP: new share codes
@@ -3826,6 +3885,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error(400, "lat and lon in Slovakia", cors=True)
             pack = p2p_pack(round(lat, 3), round(lon, 3))
             return self.send(200, pack, headers=self.cors()) if pack else self.error(503, "Timetable not loaded", cors=True)
+        if method == "GET" and route == "p2p/boards":
+            # 2.19.0: boards for stops a phone without data asked for (its question heard over Bluetooth): codes only,
+            # nothing about who asked; the phone with data broadcasts the answer to everyone around.
+            if not p2p_ask_limiter.allow(self.client_ip()):
+                return self.error(429, "Too many requests", cors=True)
+            try:
+                lat, lon = float(query.get("lat") or ""), float(query.get("lon") or "")
+                codes = [int(x, 16) & 0xFFFFFF for x in (query.get("codes") or "").split(",") if x][:3]
+            except ValueError:
+                lat = lon = 0.0
+                codes = []
+            if not (47 < lat < 50 and 16.5 < lon < 23) or not codes:
+                return self.error(400, "codes, and lat and lon in Slovakia", cors=True)
+            asked = p2p_asked(codes, round(lat, 3), round(lon, 3))
+            return self.send(200, asked, headers=self.cors()) if asked else self.error(503, "Timetable not loaded", cors=True)
         if method == "GET" and route == "p2p/key":
             return self.send(200, {"key": base64.b64encode(p2p_public_der(p2p_key())).decode()}, headers=self.cors())
         if route.startswith("shares"):
