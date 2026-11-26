@@ -59,7 +59,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.65.0"
+VERSION = "1.65.1"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -1598,10 +1598,11 @@ def p2p_wire(vehicles, at, d, lat, lon, crowd_of=lambda keys: 0):
 def p2p_board_wire(station, departures, delays, notices, at, d):
     """
     The stop packet {"v": 1, "k": "s", "at", "st": stop name, "n": [[notice sk, notice en]], "r": [[line, headsign,
-    leaves epoch s, delay s or null]]}: the next departures from the stop nearest the phone, with the live delays known,
-    and the notices that concern it (its lines or its stop, or everyone).
+    leaves epoch s, delay s or null, hub trip id, its stop number here]]}: the next departures from the stop nearest the
+    phone, with the live delays known, and the notices that concern it (its lines or its stop, or everyone). The trip id
+    and stop number let a phone without data follow the bus (its stops from the offline timetables until it has data).
     """
-    rows = [[x["line"], x["headsign"][:28], x["at"] // 1000, delays.get(x["tripId"])] for x in departures]
+    rows = [[x["line"], x["headsign"][:28], x["at"] // 1000, delays.get(x["tripId"]), x["tripId"], x.get("seq", 0)] for x in departures]
     return p2p_signed(d, {"v": 1, "k": "s", "at": at, "st": station, "n": notices}, rows)
 
 
