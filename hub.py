@@ -59,7 +59,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.66.1"
+VERSION = "1.66.2"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -1621,7 +1621,7 @@ def p2p_stations(t, h):
         return _p2p_hashes[1].get(h, [])
 
 
-def p2p_board_wire(station, departures, delays, notices, at, d, station_id=""):
+def p2p_board_wire(station, departures, delays, notices, at, d, station_id="", answer=False):
     """
     The stop packet {"v": 1, "k": "s", "at", "st": stop name, "n": [[notice sk, notice en]], "r": [[line, headsign,
     leaves epoch s, delay s or null, hub trip id, its stop number here]]}: the next departures from the stop nearest the
@@ -1630,7 +1630,9 @@ def p2p_board_wire(station, departures, delays, notices, at, d, station_id=""):
     """
     rows = [[x["line"], x["headsign"][:28], x["at"] // 1000, delays.get(x["tripId"]), x["tripId"], x.get("seq", 0)] for x in departures]
     # "sid": which stop it is, so a phone that asked for it (by its code) knows this is its answer.
-    return p2p_signed(d, {"v": 1, "k": "s", "at": at, "st": station, "sid": station_id, "n": notices}, rows)
+    # "q": an answer to a question (the asked stop or a cover stop), never shown as the stop around the phone (EM-0137).
+    head = {"v": 1, "k": "s", "at": at, "st": station, "sid": station_id, "n": notices, **({"q": 1} if answer else {})}
+    return p2p_signed(d, head, rows)
 
 
 def p2p_notices(conn, station, lines):
@@ -1643,9 +1645,9 @@ def p2p_notices(conn, station, lines):
     return out[:2]
 
 
-def p2p_board_for(t, s, delays):
+def p2p_board_for(t, s, delays, answer=False):
     """A station's signed board (next departures, live delays known, notices), kept 30 s per station."""
-    key = ("stop", t.station_ids[s])
+    key = ("answer" if answer else "stop", t.station_ids[s])
     with _p2p_lock:
         hit = _p2p_cache.get(key)
         if hit and time.time() - hit[0] < 30:
@@ -1653,7 +1655,7 @@ def p2p_board_for(t, s, delays):
     departures = t.departures([s], int(time.time()), limit=14, groups=timetable.GROUPS)
     with db() as conn:
         notices = p2p_notices(conn, t.names[s], {x["line"] for x in departures})
-    board = p2p_board_wire(t.names[s], departures, delays, notices, now(), p2p_key(), t.station_ids[s])[0]
+    board = p2p_board_wire(t.names[s], departures, delays, notices, now(), p2p_key(), t.station_ids[s], answer)[0]
     with _p2p_lock:
         _p2p_cache[key] = (time.time(), board)
     return board
@@ -1674,7 +1676,7 @@ def p2p_asked(codes, lat, lon):
         if near:
             s = min(near)[1]
             # 1.66.1: the live delays of the buses around that stop (not around the phone that heard the question).
-            boards.append(base64.b64encode(p2p_board_for(t, s, p2p_delays_near(t.lat[s], t.lon[s]))).decode())
+            boards.append(base64.b64encode(p2p_board_for(t, s, p2p_delays_near(t.lat[s], t.lon[s]), answer=True)).decode())
     return {"boards": boards, "at": now()}
 
 

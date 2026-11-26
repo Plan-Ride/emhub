@@ -1643,4 +1643,7 @@ assert stop["r"][1] == ["31", deps[1]["headsign"][:28], 1795600060, 120, "t1", 1
 assert hub.p2p_hash("banska bystrica plazove kupalisko") == 0x234534, hex(hub.p2p_hash("banska bystrica plazove kupalisko"))  # = the app's
 board, _ = hub.p2p_board_wire("Zvolen, AS", deps[:2], {}, [], 1795600000, key, "zvolen as")
 assert json.loads(json.loads(zlib.decompress(board))["p"])["sid"] == "zvolen as", "an asked stop's board says which it is"
+assert "q" not in json.loads(json.loads(zlib.decompress(board))["p"]), "the stop around the phone is no answer"
+answer, _ = hub.p2p_board_wire("Zvolen, AS", deps[:2], {}, [], 1795600000, key, "zvolen as", answer=True)
+assert json.loads(json.loads(zlib.decompress(answer))["p"])["q"] == 1, "EM-0137: an answer (asked or cover stop) says so"
 print("ok p2p packets")
