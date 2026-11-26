@@ -548,6 +548,7 @@ assert tc.resolve("town park") == tt.resolve("town park"), "sadzv's Park is our 
 wed = tc.plan(tc.resolve("town namestie x"), tc.resolve("town park"), at("06:50"), 1)[0]["legs"][0]
 assert (wed["line"], hm(wed["departure"]), wed["live"]["lineId"], wed["from"]["platformId"], wed["to"]["seq"]) == ("9", "30 07:00", 77, 501, 2), wed
 assert (wed["live"]["fromIndex"], wed["live"]["toIndex"]) == (0, 1) and tc.trip(wed["tripId"])["stops"][1]["name"] == "Town, Park",     "on another day the apps open the timetable trip"
+assert tc.trip(wed["tripId"])["live"] == {"lineId": 77, "route": "9001", "trip": 5}, "a city trip says which S.A.D. bus it is (live delay)"
 sat = int(datetime.datetime(2026, 10, 3, 6, 50, tzinfo=timetable.ZONE).timestamp())
 assert tc.plan(tc.resolve("town namestie x"), tc.resolve("town park"), sat, 1) == [], "a workday's buses don't run on Saturday"
 x = tc.resolve("town namestie x")

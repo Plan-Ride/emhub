@@ -1686,6 +1686,8 @@ class Timetable:
                 stops[k].update(platformId=int(pid), seq=k + 1, stopId=self.city_platforms[pid][4])
         out = {"tripId": trip_id, "line": trip[2], "headsign": trip[3] or stops[-1]["name"], "operator": trip[4],
                "mode": trip[5], "stops": stops}
+        if city:  # 1.66.1: which S.A.D. Zvolen bus it is, so an app following the timetable trip asks for its live delay
+            out["live"] = {"lineId": city[0], "route": city[1], "trip": city[2]}
         if len(chain) > len(trip[7]):
             out["headsign"] = self.trips[chain[-1][2]][3] or stops[-1]["name"]
             out["continues"] = self.continues_json(chain, service_day)

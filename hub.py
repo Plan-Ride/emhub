@@ -59,7 +59,7 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.66.0"
+VERSION = "1.66.1"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -1667,18 +1667,23 @@ def p2p_asked(codes, lat, lon):
     t = timetable.current
     if t is None:
         return None
-    pack = p2p_pack(lat, lon)  # the buses around (cached): their delays go on the boards
-    cell = (round(lat, 2), round(lon, 2))
-    with _p2p_lock:
-        hit = _p2p_cache.get(cell)
-    delays = hit[1][2] if hit else {}
     boards = []
     for code in codes[:3]:
         near = [(timetable.meters(lat, lon, t.lat[s], t.lon[s]), s) for s in p2p_stations(t, code) if t.lat[s] is not None]
         near = [x for x in near if x[0] <= 60_000]
         if near:
-            boards.append(base64.b64encode(p2p_board_for(t, min(near)[1], delays)).decode())
-    return {"boards": boards, "at": now(), "nearby": pack is not None}
+            s = min(near)[1]
+            # 1.66.1: the live delays of the buses around that stop (not around the phone that heard the question).
+            boards.append(base64.b64encode(p2p_board_for(t, s, p2p_delays_near(t.lat[s], t.lon[s]))).decode())
+    return {"boards": boards, "at": now()}
+
+
+def p2p_delays_near(lat, lon):
+    """The live delays (hub trip id: seconds) of the buses around a place, from its buses packet (kept 30 s per ~1 km)."""
+    p2p_pack(round(lat, 3), round(lon, 3))
+    with _p2p_lock:
+        hit = _p2p_cache.get((round(round(lat, 3), 2), round(round(lon, 3), 2)))
+    return hit[1][2] if hit else {}
 
 
 def p2p_pack(lat, lon):
