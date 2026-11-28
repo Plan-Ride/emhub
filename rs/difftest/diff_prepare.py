@@ -68,7 +68,43 @@ def answer(route, query):
     return [status, body]
 
 
-answers = [answer(r, x) for r, x in q]
+# community/delay at one fixed moment just after the newest report (HUB_FAKE_NOW for Rust)
+with hub.db() as conn:
+    NOW = conn.execute("SELECT MAX(created_at) FROM community_reports").fetchone()[0] + 90
+    keys = [r[0] for r in conn.execute("SELECT trip_key FROM community_reports GROUP BY trip_key ORDER BY MAX(created_at) DESC LIMIT 1200")]
+    keys += [r[0] for r in conn.execute("SELECT DISTINCT trip_key FROM crowd_reports ORDER BY created_at DESC LIMIT 200")]
+hub.now = lambda: NOW
+open(f"{out}/now.txt", "w").write(str(NOW))
+for k in keys:
+    add("community/delay", trip=k)
+day = timetable.datetime.fromtimestamp(NOW, timetable.ZONE).date()
+for i in random.sample(range(len(t.trips)), 3000):
+    if (day - t.first_day).days in t.services.get(t.trips[i][6], ()):
+        for k in t.community_keys(i, day):
+            add("community/delay", trip=k)
+for bad in ["", " ", "x", "a|b|c", "sadzv|1|2|nope|5", "x" * 400]:
+    add("community/delay", trip=bad)
+
+
+def answer_community(query):
+    key = hub.clean(dict(urllib.parse.parse_qsl(query)).get("trip"), 300)
+    if not key:
+        return [400, {"error": "trip is required"}]
+    try:
+        return [200, hub.community_delay(key)]
+    except (ValueError, json.JSONDecodeError) as error:
+        return [400, {"error": str(error)}]
+
+
+answers = [answer_community(x) if r == "community/delay" else answer(r, x) for r, x in q]
+# ...and each at its own moment: 30 s after one of its reports, so live delays (phones, taps, outliers) are compared
+with hub.db() as conn:
+    moments = conn.execute("SELECT trip_key, created_at FROM community_reports ORDER BY RANDOM() LIMIT 1500").fetchall()
+for key, at in moments:
+    hub.now = lambda at=at: at + 30
+    q.append(("community/delay", urllib.parse.urlencode({"trip": key}) + f"\t{at + 30}"))
+    answers.append(answer_community(q[-1][1].split("\t")[0]))
+hub.now = lambda: NOW
 trips = sorted({d["tripId"] for status, body in answers if status == 200 for d in body.get("departures", [])})
 random.shuffle(trips)
 for tid in trips[:2500]:
@@ -77,6 +113,17 @@ for tid in trips[:2500]:
 for bad in ["x", "a:b:c", "nope:x:20261128", t.trips[0][0] + ":" + t.trips[0][1] + ":20261399"]:
     q.append(("trip", urllib.parse.urlencode({"id": bad})))
     answers.append(answer("trip", q[-1][1]))
+# path: the stops of trips as the apps send them, some moved a little, and broken ones
+for status, body in answers[-2504:-4]:
+    if status == 200 and body.get("tripId") and random.random() < 0.4:
+        pts = [(s["lat"], s["lon"]) for s in body["stops"] if s.get("lat") is not None]
+        if random.random() < 0.3:
+            pts = [(round(a + random.uniform(-.0005, .0005), 6), round(b + random.uniform(-.0005, .0005), 6)) for a, b in pts]
+        q.append(("path", urllib.parse.urlencode({"stops": ";".join(f"{a},{b}" for a, b in pts)})))
+        answers.append(answer("path", q[-1][1]))
+for bad in ["", "48.7", "48.7,19.1;x,1", "48.7,19.1;48.71", "48.7,19.1,5;48.71,19.2"]:
+    q.append(("path", urllib.parse.urlencode({"stops": bad})))
+    answers.append(answer("path", q[-1][1]))
 with open(f"{out}/queries.txt", "w", encoding="utf-8") as f:
     f.writelines(f"{r}\t{x}\n" for r, x in q)
 with open(f"{out}/python.jsonl", "w", encoding="utf-8") as f:

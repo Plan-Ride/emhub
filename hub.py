@@ -3087,6 +3087,18 @@ def trip_delay(conn, trip_key):
     return result
 
 
+def community_delay(key):
+    """GET community/delay: riders' delay of a trip now, how late it usually is, how full it is."""
+    with db() as conn:
+        delay = trip_delay(conn, key)
+        # EM-0093: nobody on this part of the bus yet, but riders who got on earlier (it went on as this trip).
+        for other in ([] if delay or timetable.current is None else timetable.current.same_bus_keys(key)):
+            delay = trip_delay(conn, other)
+            if delay:
+                break
+        return {"trip": key, "delay": delay, "history": trip_history(conn, key), "crowd": crowd_now(conn, key)}
+
+
 # ------------------------------------------------------------------ OIDC (Authentik)
 
 _discovery = {}
@@ -3962,15 +3974,7 @@ class Handler(BaseHTTPRequestHandler):
             key = clean(query.get("trip"), 300)
             if not key:
                 return self.error(400, "trip is required", cors=True)
-            with db() as conn:
-                delay = trip_delay(conn, key)
-                # EM-0093: nobody on this part of the bus yet, but riders who got on earlier (it went on as this trip).
-                for other in ([] if delay or timetable.current is None else timetable.current.same_bus_keys(key)):
-                    delay = trip_delay(conn, other)
-                    if delay:
-                        break
-                return self.send(200, {"trip": key, "delay": delay, "history": trip_history(conn, key),
-                                       "crowd": crowd_now(conn, key)}, headers=self.cors())
+            return self.send(200, community_delay(key), headers=self.cors())
         if method == "POST" and route == "community/crowd":
             # 2.17.0: how full the bus is, from a rider on it (the apps ask only once it has left their stop).
             data = self.json_body(limit=2_000)

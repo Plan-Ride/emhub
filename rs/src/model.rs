@@ -61,7 +61,7 @@ struct Snapshot {
     central: Vec<u32>,
     children: HashMap<String, Vec<(u32, Value)>>,
     parent_of: HashMap<String, (u32, Value)>,
-    segment_ends: HashMap<String, [[f64; 2]; 2]>,
+    segments: HashMap<String, Value>,
     city: HashMap<String, (i64, Value, i64, String, Vec<String>)>,
     city_platforms: HashMap<String, Vec<Value>>,
 }
@@ -91,7 +91,11 @@ pub struct Timetable {
     pub central: HashSet<u32>,
     pub children: HashMap<u32, Vec<(u32, Value)>>,
     pub parent_of: HashMap<u32, (u32, Value)>,
+    /// road traces "a>b" (station ids) -> [[lat, lon], ...], drawn in the dashboard or along the railway
+    pub segments: HashMap<String, Value>,
     pub segment_ends: HashMap<String, [[f64; 2]; 2]>,
+    /// (line, first stop's name, first departure) -> trips (same_bus_keys)
+    pub by_start: HashMap<(String, String, i64), Vec<u32>>,
     pub city: HashMap<u32, (i64, Value, i64, String, Vec<String>)>,
     pub city_platforms: HashMap<String, Vec<Value>>,
     /// station -> (trip, stop number) of every trip stopping there
@@ -120,6 +124,15 @@ impl Timetable {
         }
         let town_keys: Vec<String> = snap.towns.iter().map(|t| t.0.clone()).collect();
         let town_index = word_index(&town_keys.iter().map(|k| k.split(' ').map(str::to_string).collect()).collect::<Vec<_>>());
+        let segment_ends = snap.segments.iter().filter_map(|(k, v)| {
+            let a = v.as_array()?;
+            let point = |p: &Value| Some([p.get(0)?.as_f64()?, p.get(1)?.as_f64()?]);
+            Some((k.clone(), [point(a.first()?)?, point(a.last()?)?]))
+        }).collect();
+        let mut by_start: HashMap<(String, String, i64), Vec<u32>> = HashMap::new();
+        for (i, t) in snap.trips.iter().enumerate() {
+            by_start.entry((t.2.clone(), snap.names[t.7[0] as usize].clone(), t.9[0])).or_default().push(i as u32);
+        }
         Ok(Timetable {
             generation: snap.generation,
             first_day: NaiveDate::parse_from_str(&snap.first_day, "%Y-%m-%d").map_err(|e| e.to_string())?,
@@ -146,7 +159,9 @@ impl Timetable {
             central: snap.central.into_iter().collect(),
             children: keyed(snap.children),
             parent_of: keyed(snap.parent_of),
-            segment_ends: snap.segment_ends,
+            segment_ends,
+            segments: snap.segments,
+            by_start,
             city: keyed(snap.city),
             city_platforms: snap.city_platforms,
             chains: Mutex::new(HashMap::new()),

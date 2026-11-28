@@ -37,7 +37,7 @@ impl Hub {
             backend,
             timetable: RwLock::new(None),
             app_keys: env("HUB_APP_KEYS", "dev-key").split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
-            routes: env("HUB_RS_ROUTES", "stops,departures,trip").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
             secure: env("HUB_PUBLIC_URL", "http://localhost:8080").starts_with("https://"),
             db_path: env("HUB_DB", "hub.db"),
             limiter: Mutex::new(HashMap::new()),
@@ -112,27 +112,36 @@ fn error(hub: &Hub, status: u16, message: &str) -> Response {
 /// Every request: a Rust route when it is one and the timetable is loaded, else Python.
 pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, request: Request) -> Response {
     let path = request.uri().path();
-    let route = path.strip_prefix("/api/v1/timetable/").map(str::to_string);
+    // "stops" for /api/v1/timetable/stops, "community/delay" for /api/v1/community/delay
+    let route = path.strip_prefix("/api/v1/timetable/").or_else(|| path.strip_prefix("/api/v1/")).map(str::to_string);
     let tt = hub.timetable.read().unwrap().clone();
     let mine = matches!(*request.method(), Method::GET | Method::HEAD)
-        && route.as_ref().is_some_and(|r| hub.routes.iter().any(|x| x == r))
+        && route.as_ref().is_some_and(|r| hub.routes.iter().any(|x| x == r) && (r == "community/delay") != path.starts_with("/api/v1/timetable/"))
         && tt.is_some();
     if !mine {
         return proxy::forward(&hub.backend, peer, request).await;
     }
     let (route, tt) = (route.unwrap(), tt.unwrap());
+    let timetable_route = path.starts_with("/api/v1/timetable/");
     let given = request.headers().get("x-app-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     if !hub.app_keys.iter().any(|k| same(&given, k)) {
         return error(&hub, 401, "Missing or wrong app key");
     }
-    if !hub.allow(&client_ip(request.headers(), peer)) {
+    if timetable_route && !hub.allow(&client_ip(request.headers(), peer)) {
         return error(&hub, 429, "Too many requests");
     }
     let query = parse_query(request.uri().query());
     let head = request.method() == Method::HEAD;
     let hub2 = hub.clone();
     let route2 = route.clone();
-    let result = tokio::task::spawn_blocking(move || timetable_query(&tt, &route2, &query).map(|(s, b)| (s, b, query))).await;
+    let result = tokio::task::spawn_blocking(move || {
+        if route2 == "community/delay" {
+            community_query(&tt, &query).map(|(s, b)| (s, b, query))
+        } else {
+            timetable_query(&tt, &route2, &query).map(|(s, b)| (s, b, query))
+        }
+    })
+    .await;
     let mut response = match result {
         Ok(Ok((status, body, query))) => {
             count_search(&hub2, &route, &query, status, &body);
@@ -233,8 +242,47 @@ pub fn timetable_query(t: &Timetable, route: &str, q: &HashMap<String, String>) 
                 None => Ok((404, json!({"error": "No such trip"}))),
             }
         }
+        "path" => {
+            // EM-0064: the roads between a trip's stops, as drawn or snapped: of the stations near each position,
+            // a pair with a road trace between them; [] without one (a straight line).
+            let mut stops: Vec<Vec<f64>> = Vec::new();
+            for p in q.get("stops").map(String::as_str).unwrap_or("").split(';').filter(|p| !p.is_empty()) {
+                match p.split(',').take(2).map(|x| x.trim().parse::<f64>()).collect::<Result<Vec<f64>, _>>() {
+                    Ok(point) => stops.push(point),
+                    Err(_) => return Ok((400, json!({"error": "stops: lat,lon;lat,lon;..."}))),
+                }
+            }
+            stops.truncate(80);
+            let all = Groups::parse(Some("bus,city,rail"));
+            let mut near: Vec<Vec<String>> = Vec::new();
+            for p in &stops {
+                if p.len() != 2 {
+                    return Err(format!("not enough values to unpack (expected 2, got {})", p.len()));
+                }
+                near.push(query::near(t, p[0], p[1], 300.0, 5, &all).iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect());
+            }
+            let hops: Vec<Value> = near
+                .windows(2)
+                .map(|w| {
+                    w[0].iter()
+                        .flat_map(|x| w[1].iter().map(move |y| format!("{x}>{y}")))
+                        .find_map(|key| t.segments.get(&key).cloned())
+                        .unwrap_or_else(|| json!([]))
+                })
+                .collect();
+            Ok((200, json!({"hops": hops})))
+        }
         _ => Ok((404, json!({"error": "Not found"}))),
     }
+}
+
+/// GET community/delay (hub.public_api): riders' delay, the usual one and how full the bus is.
+pub fn community_query(t: &Timetable, q: &HashMap<String, String>) -> Result<(u16, Value), String> {
+    let key: String = q.get("trip").map(|k| k.trim().chars().take(300).collect()).unwrap_or_default();
+    if key.is_empty() {
+        return Ok((400, json!({"error": "trip is required"})));
+    }
+    Ok((200, crate::community::community_delay(Some(t), &key)?))
 }
 
 /// re.fullmatch(r"[^:]+:.+:\d{8}", id)

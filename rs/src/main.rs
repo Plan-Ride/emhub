@@ -3,6 +3,7 @@
 //! to the Python emHUB (HUB_BACKEND, 127.0.0.1:8081), WebSockets and event streams included.
 
 mod api;
+mod community;
 mod model;
 mod proxy;
 mod query;
@@ -17,10 +18,16 @@ async fn main() {
     // emhub answer <snapshot> <queries>: each line "route<TAB>query string" answered as JSON, for comparing with Python
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 4 && args[1] == "answer" {
+        let _ = community::DB_PATH.set(std::env::var("HUB_DB").unwrap_or_else(|_| "hub.db".into()));
         let t = model::Timetable::load(&args[2]).expect("snapshot");
         for line in std::fs::read_to_string(&args[3]).expect("queries").lines() {
             let (route, q) = line.split_once('\t').unwrap_or((line, ""));
-            let out = match api::timetable_query(&t, route, &api::parse_query(Some(q))) {
+            // an optional third field: the moment to answer at
+            let (q, at) = match q.split_once('\t') { Some((q, at)) => (q, at.parse().ok()), None => (q, None) };
+            community::set_now(at);
+            let query = api::parse_query(Some(q));
+            let answer = if route == "community/delay" { api::community_query(&t, &query) } else { api::timetable_query(&t, route, &query) };
+            let out = match answer {
                 Ok((status, body)) => serde_json::json!([status, body]),
                 Err(message) => serde_json::json!([400, {"error": message}]),
             };
@@ -31,6 +38,7 @@ async fn main() {
     let listen = std::env::var("HUB_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let backend = std::env::var("HUB_BACKEND").unwrap_or_else(|_| "127.0.0.1:8081".into());
     let hub = Arc::new(api::Hub::from_env(proxy::Backend::new(backend.clone())));
+    let _ = community::DB_PATH.set(hub.db_path.clone());
     if let Ok(path) = std::env::var("HUB_SNAPSHOT") {
         tokio::spawn(watch_snapshot(hub.clone(), path));
     }

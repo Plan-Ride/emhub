@@ -2540,11 +2540,11 @@ def snapshot(t):
         services.append(sorted(days))
     trips = [[tr[0], tr[1], tr[2], tr[3], tr[4], tr[5], service_index.get(tr[6], -1), tr[7], tr[8], tr[9], tr[10]]
              for tr in t.trips]
-    ends = {}
+    segments = {}
     for key in set(edits["segments"]) | set(rail_traces):
         points = edits["segments"].get(key)
         if points:
-            ends[key] = [list(points[0]), list(points[-1])]
+            segments[key] = [list(p) for p in points]
     return {
         "version": 1, "generation": generation, "built": t.built, "first_day": t.first_day.isoformat(),
         "station_ids": t.station_ids, "names": t.names, "lat": t.lat, "lon": t.lon, "weight": t.weight,
@@ -2554,7 +2554,7 @@ def snapshot(t):
         "places": {str(s): v for s, v in t.places.items()}, "zones": {str(s): v for s, v in t.zones.items()},
         "central": sorted(t.central), "children": {str(s): [[c, info] for c, info in v] for s, v in t.children.items()},
         "parent_of": {str(s): [p, info] for s, (p, info) in t.parent_of.items()},
-        "segment_ends": ends,
+        "segments": segments,
         "city": {str(i): [c[0], c[1], c[2], c[3], list(c[4])] for i, c in t.city.items()},
         "city_platforms": {str(k): v for k, v in t.city_platforms.items()},
     }
