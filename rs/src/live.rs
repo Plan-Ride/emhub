@@ -335,8 +335,12 @@ pub fn segment_points(t: &Timetable, a: u32, b: u32, trip: &Trip, k: usize) -> V
     out
 }
 
-/// Where the timetable has `trip` t seconds into its day (Timetable._spot): (lat, lon), None when it isn't on the road.
 fn spot(t: &Timetable, trip: &Trip, time: i64) -> Option<(f64, f64)> {
+    spot_at(t, trip, time).map(|s| s.1)
+}
+
+/// Where the timetable has `trip` t seconds into its day (Timetable._spot): (next stop, (lat, lon)), None off the road.
+fn spot_at(t: &Timetable, trip: &Trip, time: i64) -> Option<(u32, (f64, f64))> {
     let (st, arr, dep) = (&trip.7, &trip.8, &trip.9);
     if time < dep[0] || time > arr[arr.len() - 1] {
         return None;
@@ -346,7 +350,7 @@ fn spot(t: &Timetable, trip: &Trip, time: i64) -> Option<(f64, f64)> {
     t.point(a)?;
     t.point(b)?;
     let f = if time <= dep[k] { 0.0 } else { 1f64.min((time - dep[k]) as f64 / (arr[k + 1] - dep[k]).max(1) as f64) };
-    Some(along(&segment_points(t, a, b, trip, k), f))
+    Some((b, along(&segment_points(t, a, b, trip, k), f)))
 }
 
 /// How far bus v is from where `trip` would be with its delay; None when v isn't that trip (Timetable._fits).
@@ -399,6 +403,140 @@ fn city_day(t: &Timetable, day: i64) -> HashMap<(i64, i64), u32> {
     out
 }
 
+/// The city buses whose trip number fits (Timetable.trusted): (keys, plates of those buses).
+fn trusted(t: &Timetable, gps: &Gps, today: &HashMap<(i64, i64), u32>, time: i64, base: i64) -> (HashSet<(i64, i64)>, HashSet<String>) {
+    let (mut keys, mut plates) = (HashSet::new(), HashSet::new());
+    for (k, b) in &gps.keyed {
+        if let Some(&i) = today.get(k) {
+            if fits(t, &t.trips[i as usize], time, b, base).is_some() {
+                keys.insert(*k);
+                if let Some(p) = b.plate.as_ref().filter(|p| !p.is_empty()) {
+                    plates.insert(p.clone());
+                }
+            }
+        }
+    }
+    (keys, plates)
+}
+
+/// Python's round(x, n): the exact value rounded, read back.
+pub fn round_to(x: f64, n: usize) -> f64 {
+    format!("{x:.n$}").parse().unwrap_or(x)
+}
+
+/// Buses on the road at `when` in box (south, west, north, east) (Timetable.vehicles): where the timetable puts them, or
+/// as late as riders say (delay_of), or where their own GPS or the city's page has them.
+pub fn vehicles(t: &Timetable, when: i64, bx: (f64, f64, f64, f64), delay_of: &mut dyn FnMut(&[String]) -> Option<Value>, gps: &Gps, with_keys: bool) -> Vec<Value> {
+    let (south, west, north, east) = bx;
+    let d = local_date(when);
+    let base_d = base_epoch(d);
+    let today = city_day(t, t.day_number(d));
+    let (trusted, mut taken) = trusted(t, gps, &today, when - base_d, base_d);
+    let all = crate::query::Groups::parse(Some("bus,city,rail"));
+    let mut out = Vec::new();
+    let mut seen: HashSet<(u32, chrono::NaiveDate)> = HashSet::new();
+    let mut line_ids: Option<HashMap<String, Vec<i64>>> = None;
+    for day in [crate::plan::day(t, d - chrono::Duration::days(1), &all), crate::plan::day(t, d, &all)] {
+        let t0 = when - day.base;
+        let lo = day.deps.partition_point(|&x| x < t0 - 3 * 3600);
+        let hi = day.deps.partition_point(|&x| x <= t0 + 3600);
+        let mut runs: Vec<i64> = Vec::new();
+        let mut had: HashSet<i64> = HashSet::new();
+        for c in &day.conns[lo..hi] {
+            if had.insert(c.run) {
+                runs.push(c.run);
+            }
+        }
+        for run in runs {
+            let (index, shift) = ((run / 3) as u32, run % 3);
+            let service_day = day.date + chrono::Duration::days(shift - 1);
+            if !seen.insert((index, service_day)) {
+                continue;
+            }
+            let trip = &t.trips[index as usize];
+            let pts: Vec<(f64, f64)> = trip.7.iter().filter_map(|&s| t.point(s)).collect();
+            if pts.is_empty() {
+                continue;
+            }
+            let m = 0.03;
+            let lats = pts.iter().map(|p| p.0);
+            let lons = pts.iter().map(|p| p.1);
+            let tb = (lats.clone().fold(f64::INFINITY, f64::min) - m, lons.clone().fold(f64::INFINITY, f64::min) - m,
+                      lats.fold(f64::NEG_INFINITY, f64::max) + m, lons.fold(f64::NEG_INFINITY, f64::max) + m);
+            if tb.0 > north || tb.2 < south || tb.1 > east || tb.3 < west {
+                continue;
+            }
+            let offset = base_epoch(service_day) - day.base;
+            let mut keys = crate::community::community_keys(t, index, service_day);
+            if let Some(&root) = day.vehicle.get(&run) {
+                // EM-0091: a bus going on as another trip: riders who followed it from the start report under that trip
+                keys.extend(crate::community::community_keys(t, (root / 3) as u32, day.date + chrono::Duration::days(root % 3 - 1)));
+            }
+            let mut live = delay_of(&keys);
+            let gps_live = |l: &Option<Value>| l.as_ref().is_some_and(|l| l["source"] == "gps");
+            let city = t.city.get(&index);
+            let mut bus: Option<Bus> = match city {
+                Some(c) if service_day == d && trusted.contains(&(c.0, c.2)) && !gps_live(&live) => gps.keyed.get(&(c.0, c.2)).cloned(),
+                _ => None,
+            };
+            if let Some(b) = &bus {
+                live = Some(json!({"delaySeconds": b.delay, "source": "bus"}));
+            } else if (city.is_some() || trip.0 == "dpmbb") && service_day == d && !gps_live(&live) {
+                // 1.67.0: DPMBB's trolleybus trips have no sadzv line id: its line's ids by number
+                let ids: Vec<i64> = match city {
+                    Some(c) => vec![c.0],
+                    None => {
+                        let map = line_ids.get_or_insert_with(|| {
+                            let mut m: HashMap<String, Vec<i64>> = HashMap::new();
+                            let mut indexes: Vec<&u32> = t.city.keys().collect();
+                            indexes.sort();
+                            for i in indexes {
+                                let c = &t.city[i];
+                                let v = m.entry(c.3.clone()).or_default();
+                                if !v.contains(&c.0) {
+                                    v.push(c.0);
+                                }
+                            }
+                            m
+                        });
+                        map.get(&trip.2).cloned().unwrap_or_default()
+                    }
+                };
+                let buses: Vec<Bus> = ids.iter().flat_map(|i| gps.portal.get(i).cloned().unwrap_or_default()).collect();
+                if let Some(b) = portal_bus(t, trip, t0 - offset, &buses, &taken, when - (t0 - offset)).cloned() {
+                    if let Some(p) = &b.plate {
+                        taken.insert(p.clone());
+                    }
+                    live = Some(json!({"delaySeconds": b.delay, "source": "city"}));
+                    bus = Some(b);
+                }
+            }
+            let delay = live.as_ref().and_then(|l| l["delaySeconds"].as_i64()).unwrap_or(0);
+            let Some((next, at)) = spot_at(t, trip, t0 - delay - offset) else { continue };
+            let (lat, lon) = bus.as_ref().map_or(at, |b| (b.lat, b.lon));
+            if !(south <= lat && lat <= north && west <= lon && lon <= east) {
+                continue;
+            }
+            let headsign = if trip.3.is_empty() { t.names[*trip.7.last().unwrap() as usize].clone() } else { trip.3.clone() };
+            let mut v = json!({"tripId": format!("{}:{}:{}", trip.0, trip.1, service_day.format("%Y%m%d")), "line": trip.2,
+                               "headsign": headsign, "mode": trip.5, "operator": trip.4, "lat": round_to(lat, 6), "lon": round_to(lon, 6),
+                               "next": t.names[next as usize], "live": live.is_some(),
+                               "delay": live.as_ref().map(|l| l["delaySeconds"].clone()), "source": live.as_ref().map(|l| l["source"].clone())});
+            if let Some(p) = bus.as_ref().filter(|b| b.dest.is_some()).and_then(|b| b.plate.clone()) {
+                v["plate"] = json!(p);
+            }
+            if let Some(c) = city {
+                v["sadzv"] = json!([c.0, c.2]);
+            }
+            if with_keys {
+                v["keys"] = json!(keys);
+            }
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// GET timetable/bus: {"bus": {"lat", "lon", "delaySeconds", "source"} or null, "checked", "at"} (hub + Timetable.city_bus).
 pub fn bus_answer(t: &Timetable, gps: &Gps, line_id: i64, trip_number: i64, when: i64) -> Value {
     if line_id == 0 {
@@ -408,17 +546,7 @@ pub fn bus_answer(t: &Timetable, gps: &Gps, line_id: i64, trip_number: i64, when
     let (day, base) = (t.day_number(d), base_epoch(d));
     let time = when - base;
     let today = city_day(t, day);
-    let (mut trusted, mut taken) = (HashSet::new(), HashSet::new());
-    for (k, b) in &gps.keyed {
-        if let Some(&i) = today.get(k) {
-            if fits(t, &t.trips[i as usize], time, b, base).is_some() {
-                trusted.insert(*k);
-                if let Some(p) = b.plate.as_ref().filter(|p| !p.is_empty()) {
-                    taken.insert(p.clone());
-                }
-            }
-        }
-    }
+    let (trusted, taken) = trusted(t, gps, &today, time, base);
     let checked = today.contains_key(&(line_id, trip_number));
     let key = (line_id, trip_number);
     if trusted.contains(&key) {

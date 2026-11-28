@@ -7,6 +7,7 @@ mod community;
 mod fares;
 mod live;
 mod model;
+mod p2p;
 mod plan;
 mod planapi;
 mod proxy;
@@ -48,6 +49,7 @@ async fn main() {
             let query = api::parse_query(Some(q));
             let answer = match route {
                 "community/delay" => api::community_query(&t, &query),
+                "p2p/pack" | "p2p/boards" | "p2p/key" | "notices" | "fares" => api::public_query(&t, route, &query, gps.as_ref()),
                 "plan" => planapi::plan_query(t.clone(), query).await,
                 "sadzv" => {
                     let point = |k: &str| { let (a, b) = query[k].split_once(',').unwrap(); (a.parse().unwrap(), b.parse().unwrap()) };

@@ -111,7 +111,7 @@ fn aggregate_delay(reports: &[&Report], now_s: i64) -> Option<Value> {
                 "lastStopIndex": newest.stop_index, "lastStopName": newest.stop_name}))
 }
 
-fn trip_delay(key: &str) -> Result<Option<Value>, String> {
+pub fn trip_delay(key: &str) -> Result<Option<Value>, String> {
     let now_s = now();
     let rows: Vec<Report> = with_db(|c| {
         let mut st = c.prepare_cached(
@@ -248,7 +248,7 @@ fn trip_history(key: &str) -> Result<Value, String> {
     }))
 }
 
-fn crowd_now(key: &str) -> Result<Value, String> {
+pub fn crowd_now(key: &str) -> Result<Value, String> {
     let now_s = now();
     let row: Option<(i64, i64)> = with_db(|c| {
         let mut st = c.prepare_cached(
@@ -262,7 +262,7 @@ fn crowd_now(key: &str) -> Result<Value, String> {
 }
 
 /// The keys riders' reports for a trip go under (Timetable.community_keys).
-fn community_keys(t: &Timetable, index: u32, day: NaiveDate) -> Vec<String> {
+pub fn community_keys(t: &Timetable, index: u32, day: NaiveDate) -> Vec<String> {
     let trip = &t.trips[index as usize];
     let mut keys = vec![format!("{}|{}|{}", trip.2, t.names[trip.7[0] as usize], (base_epoch(day) + trip.9[0]) * 1000)];
     if let Some(c) = t.city.get(&index) {
@@ -348,4 +348,42 @@ pub fn community_delay(t: Option<&Timetable>, key: &str) -> Result<Value, String
         }
     }
     Ok(json!({"trip": key, "delay": delay, "history": trip_history(key)?, "crowd": crowd_now(key)?}))
+}
+
+/// Notices showing now: started (or no start) and not ended (hub.active_notices).
+pub fn active_notices() -> Result<Vec<Value>, String> {
+    let at = now();
+    with_db(|c| {
+        let mut st = c.prepare_cached(
+            "SELECT id, level, title_sk, title_en, body_sk, body_en, lines, stops, starts_at, ends_at, updated_at FROM notices
+             WHERE (starts_at IS NULL OR starts_at<=?1) AND (ends_at IS NULL OR ends_at>?1) ORDER BY level='warning' DESC, id DESC",
+        )?;
+        let rows = st.query_map(rusqlite::params![at], |r| {
+            let v = |i: usize| -> rusqlite::Result<Value> {
+                Ok(match r.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => Value::Null,
+                    rusqlite::types::ValueRef::Integer(n) => json!(n),
+                    rusqlite::types::ValueRef::Real(f) => json!(f),
+                    rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                    rusqlite::types::ValueRef::Blob(_) => Value::Null,
+                })
+            };
+            let lines: String = r.get(6)?;
+            let stops: String = r.get(7)?;
+            Ok(json!({"id": v(0)?, "level": v(1)?, "title_sk": v(2)?, "title_en": v(3)?, "body_sk": v(4)?, "body_en": v(5)?,
+                      "lines": lines.split(',').filter(|x| !x.is_empty()).collect::<Vec<_>>(),
+                      "stops": stops.split(';').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>(),
+                      "starts_at": v(8)?, "ends_at": v(9)?, "updated_at": v(10)?}))
+        })?;
+        rows.collect()
+    })
+}
+
+/// The trips riders reported since `since` (p2p_pack asks only those for a delay).
+pub fn reported_since(since: i64) -> Result<HashSet<String>, String> {
+    with_db(|c| {
+        let mut st = c.prepare_cached("SELECT DISTINCT trip_key FROM community_reports WHERE created_at>=?1")?;
+        let rows = st.query_map(rusqlite::params![since], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    })
 }

@@ -37,24 +37,27 @@ impl Hub {
             backend,
             timetable: RwLock::new(None),
             app_keys: env("HUB_APP_KEYS", "dev-key").split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
-            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan,p2p/pack,p2p/boards,p2p/key,notices,fares").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
             secure: env("HUB_PUBLIC_URL", "http://localhost:8080").starts_with("https://"),
             db_path: env("HUB_DB", "hub.db"),
             limiter: Mutex::new(HashMap::new()),
         }
     }
 
-    fn allow(&self, ip: &str) -> bool {
+    /// hub.RateLimiter: a fixed hour per IP and kind ("timetable" 2000, "p2p" 240, "ask" 240 questions heard).
+    fn allow(&self, kind: &str, ip: &str) -> bool {
+        let limit = if kind == "timetable" { LIMIT_PER_HOUR } else { 240 };
+        let ip = format!("{kind}|{ip}");
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64();
         let mut hits = self.limiter.lock().unwrap();
-        let (mut start, mut count) = hits.get(ip).copied().unwrap_or((now, 0));
+        let (mut start, mut count) = hits.get(&ip).copied().unwrap_or((now, 0));
         if now - start > 3600.0 {
             (start, count) = (now, 0);
         }
-        if count >= LIMIT_PER_HOUR {
+        if count >= limit {
             return false;
         }
-        hits.insert(ip.to_string(), (start, count + 1));
+        hits.insert(ip, (start, count + 1));
         if hits.len() > 50_000 {
             hits.retain(|_, v| now - v.0 <= 3600.0);
         }
@@ -116,7 +119,7 @@ pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<S
     let route = path.strip_prefix("/api/v1/timetable/").or_else(|| path.strip_prefix("/api/v1/")).map(str::to_string);
     let tt = hub.timetable.read().unwrap().clone();
     let mine = matches!(*request.method(), Method::GET | Method::HEAD)
-        && route.as_ref().is_some_and(|r| hub.routes.iter().any(|x| x == r) && (r == "community/delay") != path.starts_with("/api/v1/timetable/"))
+        && route.as_ref().is_some_and(|r| hub.routes.iter().any(|x| x == r) && OUTSIDE_TIMETABLE.contains(&r.as_str()) != path.starts_with("/api/v1/timetable/"))
         && tt.is_some();
     if !mine {
         return proxy::forward(&hub.backend, peer, request).await;
@@ -127,7 +130,8 @@ pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<S
     if !hub.app_keys.iter().any(|k| same(&given, k)) {
         return error(&hub, 401, "Missing or wrong app key");
     }
-    if timetable_route && !hub.allow(&client_ip(request.headers(), peer)) {
+    let kind = match route.as_str() { _ if timetable_route => "timetable", "p2p/pack" => "p2p", "p2p/boards" => "ask", _ => "" };
+    if !kind.is_empty() && !hub.allow(kind, &client_ip(request.headers(), peer)) {
         return error(&hub, 429, "Too many requests");
     }
     let query = parse_query(request.uri().query());
@@ -147,10 +151,12 @@ pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<S
         }
         return response;
     }
-    let gps = if route == "bus" { Some(crate::live::gps().await) } else { None };
+    let gps = if matches!(route.as_str(), "bus" | "p2p/pack" | "p2p/boards") { Some(crate::live::gps().await) } else { None };
     let result = tokio::task::spawn_blocking(move || {
         if route2 == "community/delay" {
             community_query(&tt, &query).map(|(s, b)| (s, b, query))
+        } else if !timetable_route {
+            public_query(&tt, &route2, &query, gps.as_deref()).map(|(s, b)| (s, b, query))
         } else {
             timetable_query(&tt, &route2, &query, gps.as_deref()).map(|(s, b)| (s, b, query))
         }
@@ -295,6 +301,56 @@ pub fn timetable_query(t: &Timetable, route: &str, q: &HashMap<String, String>, 
                 .collect();
             Ok((200, json!({"hops": hops})))
         }
+        _ => Ok((404, json!({"error": "Not found"}))),
+    }
+}
+
+/// The public routes outside /api/v1/timetable/ that Rust answers.
+const OUTSIDE_TIMETABLE: [&str; 6] = ["community/delay", "p2p/pack", "p2p/boards", "p2p/key", "notices", "fares"];
+
+fn slovak_point(q: &HashMap<String, String>) -> Option<(f64, f64)> {
+    let lat: f64 = q.get("lat")?.trim().parse().ok()?;
+    let lon: f64 = q.get("lon")?.trim().parse().ok()?;
+    (47.0 < lat && lat < 50.0 && 16.5 < lon && lon < 23.0).then_some((lat, lon))
+}
+
+/// int(x, 16) as Python reads it (sign, 0x, underscores between digits), masked to 24 bits.
+fn hex_code(x: &str) -> Option<u32> {
+    let x = x.trim();
+    let (negative, x) = match x.strip_prefix('-') { Some(r) => (true, r), None => (false, x.strip_prefix('+').unwrap_or(x)) };
+    let x = x.strip_prefix("0x").or_else(|| x.strip_prefix("0X")).unwrap_or(x);
+    if x.is_empty() || x.starts_with('_') || x.ends_with('_') || x.contains("__") {
+        return None;
+    }
+    let v = i128::from_str_radix(&x.replace('_', ""), 16).ok()?;
+    Some(((if negative { -v } else { v }) & 0xFFFFFF) as u32)
+}
+
+/// GET p2p/pack, p2p/boards, p2p/key, notices, fares (hub.public_api).
+pub fn public_query(t: &Timetable, route: &str, q: &HashMap<String, String>, gps: Option<&crate::live::Gps>) -> Result<(u16, Value), String> {
+    let empty = crate::live::Gps::default();
+    let gps = gps.unwrap_or(&empty);
+    match route {
+        "p2p/pack" => match slovak_point(q) {
+            None => Ok((400, json!({"error": "lat and lon in Slovakia"}))),
+            Some((lat, lon)) => Ok((200, crate::p2p::pack(t, gps, crate::live::round_to(lat, 3), crate::live::round_to(lon, 3))?)),
+        },
+        "p2p/boards" => {
+            let codes: Option<Vec<u32>> = q.get("codes").map(String::as_str).unwrap_or("").split(',').filter(|x| !x.is_empty()).map(hex_code).collect();
+            let codes: Vec<u32> = codes.map(|c| c.into_iter().take(3).collect()).unwrap_or_default();
+            let point = if codes.is_empty() && q.get("codes").is_some_and(|c| c.split(',').any(|x| !x.is_empty() && hex_code(x).is_none())) { None } else { slovak_point(q) };
+            match point {
+                Some((lat, lon)) if !codes.is_empty() => Ok((200, crate::p2p::asked(t, gps, &codes, crate::live::round_to(lat, 3), crate::live::round_to(lon, 3))?)),
+                _ => Ok((400, json!({"error": "codes, and lat and lon in Slovakia"}))),
+            }
+        }
+        "p2p/key" => {
+            use base64::Engine;
+            let key = crate::p2p::key().ok_or("no p2p key")?;
+            Ok((200, json!({"key": base64::engine::general_purpose::STANDARD.encode(crate::p2p::public_der(&key))})))
+        }
+        "notices" => Ok((200, json!({"notices": crate::community::active_notices()?}))),
+        "fares" => Ok((200, t.fares.clone())),
         _ => Ok((404, json!({"error": "Not found"}))),
     }
 }
