@@ -280,7 +280,7 @@ fn same_bus_keys(t: &Timetable, key: &str) -> Vec<String> {
     let d = local_date(ms.div_euclid(1000));
     for day in [d, d - Duration::days(1)] {
         let n = t.day_number(day);
-        let back: HashMap<u32, u32> = t.continuations(n).iter().map(|(&a, &b)| (b, a)).collect();
+        let back: HashMap<u32, u32> = t.continuations(n).pairs.iter().map(|&(a, b)| (b, a)).collect();
         let start = ms.div_euclid(1000) - base_epoch(day);
         for &i in t.by_start.get(&(line.to_string(), first.to_string(), start)).into_iter().flatten() {
             if !t.runs(&t.trips[i as usize], n) {
@@ -306,6 +306,32 @@ fn same_bus_keys(t: &Timetable, key: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// This trip's delay on each of its last runs on the same kind of day (hub.history_runs).
+fn history_runs(key: &str) -> Result<Vec<(String, f64)>, String> {
+    Ok(history_reports(key)?.into_iter().map(|(d, r)| { let v = run_delay(&r); (d, v) }).collect())
+}
+
+/// 2.17.0: how often a change worked on earlier days (hub.transfer_odds): {"worked", "runs"}, None with too few runs.
+pub fn transfer_odds(arriving_key: &str, leaving_key: &str, slack_s: i64) -> Result<Option<Value>, String> {
+    let arriving = history_runs(arriving_key)?;
+    if arriving.len() < HISTORY_MIN_RUNS {
+        return Ok(None);
+    }
+    let leaving: HashMap<String, f64> = history_runs(leaving_key)?.into_iter().collect();
+    let usual = if leaving.is_empty() { 0.0 } else { median(leaving.values().copied().collect()) };
+    let worked = arriving.iter().filter(|(d, a)| a - leaving.get(d).copied().unwrap_or(usual) <= slack_s as f64).count();
+    Ok(Some(json!({"worked": worked, "runs": arriving.len()})))
+}
+
+/// The key riders' reports of a planner leg go under (hub.add_transfer_odds' key): the sadzv one for a city bus.
+pub fn leg_key(t: &Timetable, trip_id: &str) -> Option<String> {
+    let (feed, rest) = trip_id.split_once(':')?;
+    let (tid, day) = rest.rsplit_once(':')?;
+    let index = *t.trip_index.get(&(feed.to_string(), tid.to_string()))?;
+    let day = NaiveDate::parse_from_str(day, "%Y%m%d").ok()?;
+    community_keys(t, index, day).pop()
 }
 
 /// GET community/delay (hub.community_delay).

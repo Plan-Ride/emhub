@@ -2523,6 +2523,7 @@ def start(folder, feeds, collect=None):
 # this process, so requests here don't wait for it. Empty HUB_SNAPSHOT: none written.
 SNAPSHOT = os.environ.get("HUB_SNAPSHOT", "")
 generation, _changed_at = 0, 0.0
+snapshot_extra = lambda: {}  # noqa: E731 - hub.py sets it: what the snapshot carries besides the timetable (prices, zones)
 
 
 def changed():
@@ -2557,6 +2558,8 @@ def snapshot(t):
         "segments": segments,
         "city": {str(i): [c[0], c[1], c[2], c[3], list(c[4])] for i, c in t.city.items()},
         "city_platforms": {str(k): v for k, v in t.city_platforms.items()},
+        "foot": t.foot,
+        **snapshot_extra(),
     }
 
 

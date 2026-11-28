@@ -4,10 +4,14 @@
 
 mod api;
 mod community;
+mod fares;
 mod live;
 mod model;
+mod plan;
+mod planapi;
 mod proxy;
 mod query;
+mod sadzv;
 mod text;
 
 use std::net::SocketAddr;
@@ -20,7 +24,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 4 && args[1] == "answer" {
         let _ = community::DB_PATH.set(std::env::var("HUB_DB").unwrap_or_else(|_| "hub.db".into()));
-        let t = model::Timetable::load(&args[2]).expect("snapshot");
+        let t = Arc::new(model::Timetable::load(&args[2]).expect("snapshot"));
         // HUB_TEST_LIVE: a folder with the live sources' answers (sadzv.json, fleet.json, page.txt) as Python got them
         let gps = std::env::var("HUB_TEST_LIVE").ok().map(|dir| {
             let read = |f: &str| std::fs::read_to_string(format!("{dir}/{f}")).ok();
@@ -44,6 +48,15 @@ async fn main() {
             let query = api::parse_query(Some(q));
             let answer = match route {
                 "community/delay" => api::community_query(&t, &query),
+                "plan" => planapi::plan_query(t.clone(), query).await,
+                "sadzv" => {
+                    let point = |k: &str| { let (a, b) = query[k].split_once(',').unwrap(); (a.parse().unwrap(), b.parse().unwrap()) };
+                    let tn = t.clone();
+                    let name_of = move |lat: f64, lon: f64| query::near(&tn, lat, lon, 120.0, 1, &query::Groups::old_apps()).first().and_then(|s| s["name"].as_str().map(str::to_string));
+                    Ok((200, serde_json::Value::Array(sadzv::journeys(point("a"), point("b"), query["when"].parse().unwrap(), query["n"].parse().unwrap(), name_of).await)))
+                }
+                "odds" => community::transfer_odds(&query["a"], &query["b"], query["slack"].parse().unwrap_or(0))
+                    .map(|o| (200, o.unwrap_or(serde_json::Value::Null))),
                 "gps" => Ok((200, gps.as_ref().map_or(serde_json::Value::Null, live::gps_to_json))),
                 _ => api::timetable_query(&t, route, &query, gps.as_ref()),
             };

@@ -1835,6 +1835,10 @@ def fare_zones():
     return _fare_zones
 
 
+# 2.0.0: the Rust server prices planner legs as add_tariffs does, from the same table and zones.
+timetable.snapshot_extra = lambda: {"fares": fare_table(), "fare_zones": fare_zones()}
+
+
 def fares_due():
     """Price lists that end within a week or have ended: the dashboard reminds the admins to type in the new one."""
     return [{"name": name, "validTo": day} for name, day in fares.due(fare_table(), datetime.now(ZoneInfo("Europe/Bratislava")).date())]

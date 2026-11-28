@@ -64,6 +64,25 @@ struct Snapshot {
     segments: HashMap<String, Value>,
     city: HashMap<String, (i64, Value, i64, String, Vec<String>)>,
     city_platforms: HashMap<String, Vec<Value>>,
+    #[serde(default)]
+    foot: Vec<Vec<(u32, i64)>>,
+    #[serde(default)]
+    fares: Value,
+    #[serde(default)]
+    fare_zones: Value,
+}
+
+/// Trips a bus runs one after another on a day: the pairs in the order Python's dict has them, and as a map.
+pub struct Chains {
+    pub pairs: Vec<(u32, u32)>,
+    pub next: HashMap<u32, u32>,
+}
+
+impl std::ops::Deref for Chains {
+    type Target = HashMap<u32, u32>;
+    fn deref(&self) -> &HashMap<u32, u32> {
+        &self.next
+    }
 }
 
 pub struct Timetable {
@@ -100,7 +119,14 @@ pub struct Timetable {
     pub city_platforms: HashMap<String, Vec<Value>>,
     /// station -> (trip, stop number) of every trip stopping there
     pub stops_at: Vec<Vec<(u32, u32)>>,
-    chains: Mutex<HashMap<i64, Arc<HashMap<u32, u32>>>>,
+    chains: Mutex<HashMap<i64, Arc<Chains>>>,
+    /// per station: the stations a walk joins it to, with the walk in seconds (Timetable.foot, in its order)
+    pub foot: Vec<Vec<(u32, i64)>>,
+    /// how many trips stop at each station (_tidy's "busiest stop")
+    pub busy: Vec<u32>,
+    pub fares: Value,
+    pub fare_zones: Value,
+    pub days: crate::plan::Days,
 }
 
 fn keyed<T>(map: HashMap<String, T>) -> HashMap<u32, T> {
@@ -132,6 +158,12 @@ impl Timetable {
         let mut by_start: HashMap<(String, String, i64), Vec<u32>> = HashMap::new();
         for (i, t) in snap.trips.iter().enumerate() {
             by_start.entry((t.2.clone(), snap.names[t.7[0] as usize].clone(), t.9[0])).or_default().push(i as u32);
+        }
+        let mut busy = vec![0u32; snap.names.len()];
+        for trip in &snap.trips {
+            for &s in &trip.7 {
+                busy[s as usize] += 1;
+            }
         }
         Ok(Timetable {
             generation: snap.generation,
@@ -165,6 +197,11 @@ impl Timetable {
             city: keyed(snap.city),
             city_platforms: snap.city_platforms,
             chains: Mutex::new(HashMap::new()),
+            busy,
+            foot: snap.foot,
+            fares: snap.fares,
+            fare_zones: snap.fare_zones,
+            days: Default::default(),
         })
     }
 
@@ -201,11 +238,12 @@ impl Timetable {
     }
 
     /// {trip: the trip its bus goes on as} on day n (timetable.continuations).
-    pub fn continuations(&self, n: i64) -> Arc<HashMap<u32, u32>> {
+    pub fn continuations(&self, n: i64) -> Arc<Chains> {
         if let Some(found) = self.chains.lock().unwrap().get(&n) {
             return found.clone();
         }
         let mut found = HashMap::new();
+        let mut pairs = Vec::new();
         for group in &self.blocks {
             let mut running: Vec<u32> = group.iter().copied().collect::<HashSet<_>>().into_iter().filter(|&t| self.runs(&self.trips[t as usize], n)).collect();
             running.sort();
@@ -213,10 +251,11 @@ impl Timetable {
             for pair in running.windows(2) {
                 if !found.contains_key(&pair[0]) && self.goes_on(pair[0], pair[1]) {
                     found.insert(pair[0], pair[1]);
+                    pairs.push((pair[0], pair[1]));
                 }
             }
         }
-        let found = Arc::new(found);
+        let found = Arc::new(Chains { pairs, next: found });
         let mut chains = self.chains.lock().unwrap();
         if chains.len() > 16 {
             chains.clear();

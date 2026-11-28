@@ -212,7 +212,7 @@ pub fn merge(raw: &Raw, now: f64) -> Gps {
 
 // ---- fetching, cached
 
-fn client() -> &'static reqwest::Client {
+pub fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| reqwest::Client::builder().user_agent("emhub (Plan&Ride)").build().expect("http client"))
 }

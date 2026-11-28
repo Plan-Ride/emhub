@@ -37,7 +37,7 @@ impl Hub {
             backend,
             timetable: RwLock::new(None),
             app_keys: env("HUB_APP_KEYS", "dev-key").split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
-            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
             secure: env("HUB_PUBLIC_URL", "http://localhost:8080").starts_with("https://"),
             db_path: env("HUB_DB", "hub.db"),
             limiter: Mutex::new(HashMap::new()),
@@ -134,6 +134,19 @@ pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<S
     let head = request.method() == Method::HEAD;
     let hub2 = hub.clone();
     let route2 = route.clone();
+    if route == "plan" {
+        let mut response = match crate::planapi::plan_answer(tt, query.clone()).await {
+            Ok((status, body)) => {
+                count_search(&hub, &route, &query, status, &body);
+                answer(&hub, status, &body)
+            }
+            Err(message) => error(&hub, 400, &message),
+        };
+        if head {
+            *response.body_mut() = Body::empty();
+        }
+        return response;
+    }
     let gps = if route == "bus" { Some(crate::live::gps().await) } else { None };
     let result = tokio::task::spawn_blocking(move || {
         if route2 == "community/delay" {
@@ -168,13 +181,13 @@ fn float_param(v: &str) -> Result<f64, String> {
     v.trim().parse::<f64>().map_err(|_| format!("could not convert string to float: '{v}'"))
 }
 
-fn limit(q: &HashMap<String, String>, default: i64, top: i64) -> Result<usize, String> {
+pub fn limit(q: &HashMap<String, String>, default: i64, top: i64) -> Result<usize, String> {
     Ok(int_param(q, "n", default)?.min(top).max(1) as usize)
 }
 
 /// Epoch seconds, or a local ISO time ("2026-09-30T07:00"); empty = now (hub.when_param).
-fn when_param(value: Option<&String>) -> Result<i64, String> {
-    let Some(v) = value else { return Ok(chrono::Utc::now().timestamp()) };
+pub fn when_param(value: Option<&String>) -> Result<i64, String> {
+    let Some(v) = value else { return Ok(crate::community::now()) };
     if (9..=11).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(v.parse().unwrap());
     }
@@ -305,26 +318,34 @@ fn trip_id_shape(id: &str) -> bool {
     day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit()) && middle.len() >= 2 && middle.ends_with(':') && !middle[..middle.len() - 1].is_empty()
 }
 
-/// Stop names typed that matched nothing, counted per day (hub.count_search; plans are counted by Python).
+/// What riders search, counted per day (hub.count_search): each pair of stops a connection was asked for and whether
+/// nothing was found, and stop names typed that matched no stop. The apps' searches ahead (pre=1) don't count.
 fn count_search(hub: &Hub, route: &str, q: &HashMap<String, String>, status: u16, body: &Value) {
-    if status != 200 || q.contains_key("pre") || route != "stops" {
+    if status != 200 || q.contains_key("pre") {
         return;
     }
-    let Some(text) = q.get("q") else { return };
-    let empty = body["stops"].as_array().is_some_and(Vec::is_empty);
-    let n = text.trim().chars().count();
-    if !empty || !(4..=40).contains(&n) {
+    let (kind, a, b, empty) = if route == "plan" {
+        let none = body["connections"].as_array().map_or(true, Vec::is_empty);
+        ("route", body["from"]["id"].as_str().unwrap_or("").to_string(), body["to"]["id"].as_str().unwrap_or("").to_string(), i64::from(none))
+    } else if route == "stops" {
+        let Some(text) = q.get("q") else { return };
+        let n = text.trim().chars().count();
+        if !body["stops"].as_array().is_some_and(Vec::is_empty) || !(4..=40).contains(&n) {
+            return;
+        }
+        ("stop", crate::text::fold_joined(text), String::new(), 1)
+    } else {
         return;
-    }
+    };
     let day = local_date(chrono::Utc::now().timestamp()).format("%Y-%m-%d").to_string();
-    let (path, a) = (hub.db_path.clone(), crate::text::fold_joined(text));
+    let path = hub.db_path.clone();
     tokio::task::spawn_blocking(move || {
         let result = rusqlite::Connection::open(&path).and_then(|conn| {
             conn.busy_timeout(std::time::Duration::from_secs(10))?;
             conn.execute(
-                "INSERT INTO search_stats(day, kind, a, b, n, empty) VALUES (?1,'stop',?2,'',1,1)
+                "INSERT INTO search_stats(day, kind, a, b, n, empty) VALUES (?1,?2,?3,?4,1,?5)
                  ON CONFLICT(day, kind, a, b) DO UPDATE SET n=n+1, empty=empty+excluded.empty",
-                rusqlite::params![day, a],
+                rusqlite::params![day, kind, a, b, empty],
             )
         });
         if let Err(e) = result {
