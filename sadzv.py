@@ -317,12 +317,18 @@ def fill_stops(stops, run):
 
 def vehicles():
     """
-    City buses sending their GPS now (Banska Bystrica's; Zvolen's are weeks old there): {(line id, trip number): (lat,
-    lon, delay s)}. A position over 3 minutes old doesn't count. Asked at most every 20 s.
+    City buses sending their GPS now: {(line id, trip number): (lat, lon, delay s[, folded destination, plate, left its first stop])} and
+    {(line id, "portal"): [(lat, lon, delay s, folded destination, plate)]} (buses to place by where they are), from sadzv and from the same
+    company's other address (m.mhdbb.qrbus.me, fleet.py), the fresher of the two; a bus missing from one is often on the
+    other (28 Nov 2026). A position over 3 minutes old doesn't count. Asked at most every 20 s.
     """
     def fetch():
-        out, now = {}, time.time()
-        for r in _call("getAllRtdVehicles", {}).get("vehicles") or []:
+        out, fresh, now = {}, {}, time.time()
+        try:
+            rows = _call("getAllRtdVehicles", {}).get("vehicles") or []
+        except Exception:  # noqa: BLE001 - sadzv down: mhdbb and the city's page still count
+            rows = []
+        for r in rows:
             if not isinstance(r, list) or len(r) < 8 or not r[3] or not r[0] or not r[6]:
                 continue
             try:
@@ -331,11 +337,28 @@ def vehicles():
                 continue
             if abs(now - at) <= 180:
                 out[(int(r[3]), int(r[5] or 0))] = (r[0] / 1e5, r[1] / 1e5, int(r[7] or 0))
+                fresh[(int(r[3]), int(r[5] or 0))] = at
+        try:
+            bb = fleet.city("bb")[1]
+        except Exception:  # noqa: BLE001
+            bb = []
+        for v in bb:
+            key = (int(v.get("LineId") or 0), int(v.get("TripNumber") or 0))
+            if v.get("source") == "portal" or not key[0]:
+                continue
+            if v["DeliveryDateTime"] > fresh.get(key, 0):
+                out[key], fresh[key] = (v["Latitude"] / 1e5, v["Longitude"] / 1e5, int(v.get("Delay") or 0)), v["DeliveryDateTime"]
+            # Its destination (the city's page, fleet.py) and plate: on 28 Nov the trolleybuses' trip numbers didn't match
+            # sadzv's own timetable of the day (3017 sent trip 343, running what that day's list called 339), so a bus whose
+            # trip number doesn't fit where it is is also offered like the page's buses: by line, destination and place.
+            # ...and when it left its first stop (fleet data, 0 when unknown), which tells two trips of a line apart.
+            started = v.get("ObuDepartureFirstStopTime")
+            started = started if isinstance(started, int) and 0 < now - started < 4 * 3600 else 0
+            out[key] = out[key][:3] + (fold(v.get("Destination") or ""), str(v.get("Licence") or ""), started)
+            if out[key][4]:
+                out.setdefault((key[0], "portal"), []).append(out[key])
         return out
-    try:
-        return _cached("vehicles", 20, fetch)
-    except Exception:  # noqa: BLE001 - sadzv down: the map goes by timetable and riders
-        return {}
+    return _cached("vehicles", 20, fetch)
 
 
 def _departures(ids):

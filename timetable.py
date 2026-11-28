@@ -143,6 +143,7 @@ def city_operator(lat):
     """sadzv doesn't say who runs a line (DPMBB or S.A.D. Zvolen in Banská Bystrica), so name the city's transport."""
     return "MHD Banská Bystrica" if lat and lat > 48.66 else "MHD Zvolen"
 PORTAL_M = 400                     # a bus on the city's map page this close to where a trip should be runs that trip
+START_S = 240                      # a bus that left its first stop (fleet data) this near a trip's time there runs that trip
 CITY_REUSE_DAYS = 14               # a day read from sadzv stands in for later days of its kind this long
 
 
@@ -238,6 +239,7 @@ class Timetable:
         self.city = {}           # trip index -> (lineId, route, trip number, line, sadzv platform ids) of city buses
         self.city_platforms = {} # sadzv platform id (str) -> [name, lat, lon, number, stop id]
         self._days = {}
+        self._city_day = (None, {})  # (day number, {(sadzv line id, trip number): trip index}) for trusted()
         self._lock = threading.Lock()
         self._building = threading.Lock()
         self.city_rows, self.platforms_of = {}, {}
@@ -1227,27 +1229,75 @@ class Timetable:
         f = 0.0 if t <= dep[k] else min(1.0, (t - dep[k]) / max(1, arr[k + 1] - dep[k]))
         return (b, *along(self.segment_points(a, b, trip[2], trip, k), f))
 
-    def _portal_bus(self, trip, t, buses, taken=()):
+    def _fits(self, trip, t, v, base):
         """
-        The bus from the city's map page [(lat, lon, delay s, folded destination, plate)] that runs `trip`, t seconds
-        into its day: going to the trip's end and nearest to where the trip would be with the bus's delay, PORTAL_M at most.
+        How far bus v (lat, lon, delay s[, folded destination, plate, left its first stop (epoch s)]) is from where `trip`
+        would be t seconds into its day (base: that day's epoch) with v's delay; None when v isn't that trip. qrbus's fleet
+        data says when the bus left its first stop: within START_S of the trip's time there, and 2 x PORTAL_M of its
+        place, it is that trip (on 28 Nov 2026 every start was within 2 min of the right trip, while trip numbers were
+        wrong). Without it: going to the trip's end (by word starts: the timetable's "Roosevelt.nem." is the city page's
+        "Rooseveltova nemocnica") and within PORTAL_M.
         """
-        end, best = fold(trip[3] or self.names[trip[7][-1]]), None
+        started = v[5] if len(v) > 5 else 0
+        if started and abs(started - base - trip[8][0]) > START_S:
+            return None
+        if not started and len(v) > 3 and v[3]:
+            end = fold((trip[3] or self.names[trip[7][-1]]).split(",", 1)[-1])
+            if match_score(end, v[3]) is None and match_score(v[3], end) is None:
+                return None
+        at = self._spot(trip, t - v[2])
+        far = meters(at[1], at[2], v[0], v[1]) if at else None
+        return far if far is not None and far <= (2 * PORTAL_M if started else PORTAL_M) else None
+
+    def _portal_bus(self, trip, t, buses, taken=(), base=0):
+        """
+        The bus [(lat, lon, delay s, folded destination, plate[, left its first stop])] without a trip of its own (the
+        city's map page, or a trip number that doesn't fit) that runs `trip`, t seconds into its day: the nearest that fits.
+        No destination known: by place (and start) alone.
+        """
+        best = None
         for v in buses:
-            if v[4] in taken or not v[3] or end[-len(v[3]):] != v[3]:
-                continue
-            at = self._spot(trip, t - v[2])
-            far = meters(at[1], at[2], v[0], v[1]) if at else None
-            if far is not None and far <= PORTAL_M and (best is None or far < best[0]):
+            far = None if v[4] in taken else self._fits(trip, t, v, base)
+            if far is not None and (best is None or far < best[0]):
                 best = (far, v)
         return best and best[1]
+
+    def trusted(self, when, gps):
+        """
+        The city buses whose trip number fits: that trip runs where the bus is, to its destination, from when it left its
+        first stop (_fits). On 28 Nov 2026 the trolleybuses' numbers didn't match sadzv's list of the day (3017 sent 343
+        while running 339, 3014 sent 342 going the other way), so their trips stayed grey or got another bus. Returns
+        (keys, plates of those buses, which the matching by place leaves to them).
+        """
+        d = datetime.fromtimestamp(when, ZONE).date()
+        day, t, base = (d - self.first_day).days, when - base_epoch(d), base_epoch(d)
+        if self._city_day[0] != day:
+            self._city_day = (day, {(c[0], c[2]): i for i, c in self.city.items() if day in self.services.get(self.trips[i][6], ())})
+        keys, plates = set(), set()
+        for k, b in gps.items():
+            i = self._city_day[1].get(k) if k[1] != "portal" else None
+            if i is not None and self._fits(self.trips[i], t, b, base) is not None:
+                keys.add(k)
+                if len(b) > 4 and b[4]:
+                    plates.add(b[4])
+        return keys, plates
+
+    def city_line_ids(self):
+        """{line number: {sadzv line ids}} of the city buses (a number can be Zvolen's and Banska Bystrica's)."""
+        if not getattr(self, "_line_ids", None):
+            ids = {}
+            for c in self.city.values():
+                ids.setdefault(c[3], set()).add(c[0])
+            self._line_ids = ids
+        return self._line_ids
 
     def city_bus(self, line_id, trip_number, when, gps):
         """
         Where one city bus is at `when` (the apps ask when sadzv's own answer is old or missing): {"lat", "lon",
         "delaySeconds", "source": "bus" (its GPS from sadzv) or "city" (the city's map page)}, None when nobody knows.
         """
-        bus = gps.get((line_id, trip_number))
+        trusted, taken = self.trusted(when, gps)
+        bus = gps.get((line_id, trip_number)) if (line_id, trip_number) in trusted else None
         if bus:
             return {"lat": bus[0], "lon": bus[1], "delaySeconds": bus[2], "source": "bus"}
         buses = gps.get((line_id, "portal"))
@@ -1258,7 +1308,7 @@ class Timetable:
         for index, city in self.city.items():
             trip = self.trips[index]
             if city[0] == line_id and city[2] == trip_number and day in self.services.get(trip[6], ()):
-                bus = self._portal_bus(trip, when - base_epoch(d), buses)
+                bus = self._portal_bus(trip, when - base_epoch(d), buses, taken, base_epoch(d))
                 if bus:
                     return {"lat": bus[0], "lon": bus[1], "delaySeconds": bus[2], "source": "city"}
         return None
@@ -1274,7 +1324,7 @@ class Timetable:
         PORTAL_M of it with that delay ("city").
         """
         gps = gps or {}
-        taken = set()  # ponytail: the first trip near a portal bus keeps it, not the nearest of all trips
+        trusted, taken = self.trusted(when, gps)  # ponytail: the first trip near a portal bus keeps it, not the nearest of all trips
         south, west, north, east = box
         d = datetime.fromtimestamp(when, ZONE).date()
         out, seen = [], set()
@@ -1303,12 +1353,14 @@ class Timetable:
                     keys += self.community_keys(root // 3, day.date + timedelta(days=root % 3 - 1))
                 live = delay_of(keys)
                 city = self.city.get(index)
-                bus = gps.get((city[0], city[2])) if city and service_day == d and not (live and live.get("source") == "gps") else None
+                bus = gps.get((city[0], city[2])) if city and service_day == d and (city[0], city[2]) in trusted                     and not (live and live.get("source") == "gps") else None
                 st = trip[7]
                 if bus:
                     live = {"delaySeconds": bus[2], "source": "bus"}
-                elif city and service_day == d and not (live and live.get("source") == "gps"):
-                    bus = self._portal_bus(trip, t0 - offset, gps.get((city[0], "portal"), ()), taken)
+                elif (city or trip[0] == DPMBB_FEED) and service_day == d and not (live and live.get("source") == "gps"):
+                    # 1.67.0: DPMBB's trolleybus trips (sadzv's list lacks them) have no sadzv line id: its line's ids by number
+                    ids = (city[0],) if city else self.city_line_ids().get(trip[2], ())
+                    bus = self._portal_bus(trip, t0 - offset, [b for i in ids for b in gps.get((i, "portal"), ())], taken, when - (t0 - offset))
                     if bus:
                         taken.add(bus[4])
                         live = {"delaySeconds": bus[2], "source": "city"}

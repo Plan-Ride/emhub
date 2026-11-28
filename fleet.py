@@ -24,6 +24,7 @@ MAX_AGE_S = 180
 CACHE_S = 15
 _lock = threading.Lock()
 _cache = (0, None)
+_cities = {}  # id -> (at, (summary, live rows))
 
 
 def _fetch(host):
@@ -53,13 +54,23 @@ def _city(city):
                 counted=sum(1 for x in live if any(x.get(k) for k in PASSENGERS))), live
 
 
+def city(cid):
+    """(summary, live rows) of one company, asked at most every 15 s (sadzv.py asks Banska Bystrica's every 20 s)."""
+    hit = _cities.get(cid)
+    if hit and time.time() - hit[0] <= CACHE_S:
+        return hit[1]
+    got = _city(next(c for c in CITIES if c[0] == cid))
+    _cities[cid] = (time.time(), got)
+    return got
+
+
 def snapshot(full=True):
     """{"at", "cities": [...], "vehicles": [...]}: the buses reporting now, asked for at most every 15 s."""
     global _cache
     with _lock:  # one fetch at a time: map polls wait for it instead of each asking all three
         if time.time() - _cache[0] > CACHE_S or _cache[1] is None:
             with ThreadPoolExecutor(max_workers=len(CITIES)) as pool:
-                got = list(pool.map(_city, CITIES))
+                got = list(pool.map(city, [c[0] for c in CITIES]))
             _cache = (time.time(), {"at": int(time.time()), "cities": [c for c, _ in got], "vehicles": [v for _, r in got for v in r]})
         snap = _cache[1]
     return snap if full else dict(snap, vehicles=[{k: v.get(k) for k in MAP_FIELDS} for v in snap["vehicles"]])

@@ -566,6 +566,12 @@ def line9(day):
     return [(d["feed"], hm(d["at"])) for d in tb.departures([x], t0, 10) if d["line"] == "9" and hm(d["at"]).startswith(str(day))]
 assert line9(29) == [(timetable.CITY_FEED, "29 07:00")], line9(29)
 assert line9(30) == [(timetable.DPMBB_FEED, "30 07:00")], "missing from Wednesday's sadzv: DPMBB's trip stands in"
+# 1.67.0: a trolleybus on such a trip (sadzv's number fits nothing of the day) is placed on DPMBB's trip by line and place
+_t5 = int(datetime.datetime(2026, 9, 30, 7, 5, tzinfo=timetable.ZONE).timestamp())
+_d9 = [v for v in tb.vehicles(_t5, (-90, -180, 90, 180)) if v["line"] == "9"][0]
+_bus9 = (_d9["lat"] + 0.001, _d9["lon"], 0, [], "3017")
+assert [(v["source"], v["plate"]) for v in tb.vehicles(_t5, (-90, -180, 90, 180), gps={(77, 343): _bus9, (77, "portal"): [_bus9]})
+        if v["line"] == "9"] == [("city", "3017")]
 # A city way's stops set in the map editor: an added stop is timed by distance between the trip's own stops.
 mid = tc.by_id.get("town as")
 if mid is not None:
@@ -615,19 +621,35 @@ tc._build_day = _real_build
 
 # A city bus sending its GPS (sadzv) is on the map where it is, with its delay; without it, where the timetable says.
 on_map = lambda gps: [v for v in tc.vehicles(at("07:05"), (-90, -180, 90, 180), gps=gps) if v["line"] == "9"]  # noqa: E731
-assert [(v["lat"], v["lon"], v["delay"], v["source"]) for v in on_map({(77, 5): (48.72, 19.13, 60)})] == [(48.72, 19.13, 60, "bus")]
 assert [(v["live"], v["delay"]) for v in on_map({})] == [(False, None)]
+_plain = on_map({})[0]
+_here = (_plain["lat"] + 0.001, _plain["lon"], 60)
+assert [(v["lat"], v["lon"], v["delay"], v["source"]) for v in on_map({(77, 5): _here})] == [(_here[0], _here[1], 60, "bus")]
 # 1.52.0: the city's map page doesn't say the trip: a bus of the line, going to the trip's end and near where the trip
 # should be, is that trip's; another destination or a bus far away is not
-_plain = on_map({})[0]
 _end = timetable.fold(_plain["headsign"])[-1:]
 _near = (_plain["lat"] + 0.001, _plain["lon"], 0, _end, "ZV1")
 assert [(v["lat"], v["delay"], v["source"], v["plate"]) for v in on_map({(77, "portal"): [(1.0, 1.0, 0, _end, "ZV0"), _near]})] == [(_near[0], 0, "city", "ZV1")]
 assert [v["live"] for v in on_map({(77, "portal"): [_near[:3] + (["elsewhere"], "ZV1")]})] == [False]
 assert [v["live"] for v in on_map({(77, "portal"): [(_plain["lat"] + 0.02, _plain["lon"], 0, _end, "ZV1")]})] == [False]
-assert [v["source"] for v in on_map({(77, 5): (48.72, 19.13, 60), (77, "portal"): [_near]})] == ["bus"]
+assert [v["source"] for v in on_map({(77, 5): _here, (77, "portal"): [_near]})] == ["bus"]
+# 1.67.0: a trip number that doesn't fit where the bus is (28 Nov: 3017 sent 343 running 339) isn't trusted: the bus
+# is placed like the page's, by line, destination and place; one whose number fits keeps its trip
+_far = (_plain["lat"] + 0.05, _plain["lon"], 0, [], "ZV5")
+assert [v["live"] for v in on_map({(77, 5): _far})] == [False], "a GPS 5 km from its trip isn't that trip"
+assert [(v["source"], v["plate"]) for v in on_map({(77, 9): _near, (77, "portal"): [_near]})] == [("city", "ZV1")]
+assert [(v["source"], v["plate"]) for v in on_map({(77, 5): _near, (77, "portal"): [_near]})] == [("bus", "ZV1")]
+assert [(v["source"], v.get("plate")) for v in on_map({(77, "portal"): [_near[:3] + ([], "ZV2")]})] == [("city", "ZV2")], "no destination: by place"
+# the fleet data's start from the first stop tells two trips of a line apart: 7:00's bus fits, one that left at 6:30 doesn't
+assert [v["source"] for v in on_map({(77, 5): _near + (at("07:00") + 20,), (77, "portal"): [_near + (at("07:00") + 20,)]})] == ["bus"]
+assert [v["live"] for v in on_map({(77, 5): _near + (at("06:30"),), (77, "portal"): [_near + (at("06:30"),)]})] == [False]
+# ...and outweighs the destination (the page shows a through bus's last one); without it names match by word starts
+assert [v["source"] for v in on_map({(77, 5): _near[:3] + (["elsewhere"], "ZV1", at("07:00"))})] == ["bus"]
+assert [v["source"] for v in on_map({(77, "portal"): [_near[:3] + (["par"], "ZV3")]})] == ["city"], "Roosevelt.nem. is Rooseveltova nemocnica"
 # the apps' question for one bus: sadzv's own GPS first, then the city's page, else nobody knows
-assert tc.city_bus(77, 5, at("07:05"), {(77, 5): (48.72, 19.13, 60)}) == {"lat": 48.72, "lon": 19.13, "delaySeconds": 60, "source": "bus"}
+assert tc.city_bus(77, 5, at("07:05"), {(77, 5): _here}) == {"lat": _here[0], "lon": _here[1], "delaySeconds": 60, "source": "bus"}
+assert tc.city_bus(77, 5, at("07:05"), {(77, 5): _far}) is None
+assert tc.city_bus(77, 5, at("07:05"), {(77, 9): _near, (77, "portal"): [_near]}) == {"lat": _near[0], "lon": _near[1], "delaySeconds": 0, "source": "city"}
 assert tc.city_bus(77, 5, at("07:05"), {(77, "portal"): [_near]}) == {"lat": _near[0], "lon": _near[1], "delaySeconds": 0, "source": "city"}
 assert tc.city_bus(77, 6, at("07:05"), {(77, "portal"): [_near]}) is None and tc.city_bus(77, 5, at("07:05"), {}) is None
 # EM-0014: a city bus that catches the same regional bus further on must not replace that direct bus
@@ -1578,12 +1600,16 @@ def _fake(host):
         raise OSError("down")
     return [{"Vin": 1, "DeliveryDateTime": _at, "Latitude": 4870000, "Longitude": 1910000, "LineId": 5, "DriverNumber": 7, "DutyNumber": 1, "ObuDutesTime": 2, "NumberOfPassengers": 9},
             {"Vin": 2, "DeliveryDateTime": _at - 4000, "Latitude": 4870000, "Longitude": 1910000, "LineId": 5, "NumberOfPassengers": 18}]
-fleet._fetch, fleet._cache = _fake, (0, None)  # an earlier map test may have left a real answer
-snap = fleet.snapshot()
-fleet._fetch = _real
-assert [v["Vin"] for v in snap["vehicles"]] == [1, 1], snap
+_open, _asked = fleet.urllib.request.urlopen, []
+fleet.urllib.request.urlopen = lambda request, timeout=0: (_asked.append(request.full_url), _Page())[1]
+try:
+    fleet._fetch, fleet._cache, fleet._cities = _fake, (0, None), {}  # an earlier map test may have left a real answer
+    snap = fleet.snapshot()
+finally:
+    fleet.urllib.request.urlopen, fleet._fetch, fleet._cache, fleet._cities = _open, _real, (0, None), {}
+assert [v["Vin"] for v in snap["vehicles"] if v.get("source") != "portal"] == [1, 1], snap
 assert not any("river" in k or "Dut" in k for v in snap["vehicles"] for k in v), snap["vehicles"][0]
-assert snap["cities"][0]["total"] == 2 and snap["cities"][0]["live"] == 1 and snap["cities"][0]["counted"] == 1 and "error" in snap["cities"][2], snap["cities"]
+assert snap["cities"][1]["total"] == 2 and snap["cities"][1]["live"] == 1 and snap["cities"][1]["counted"] == 1 and "error" in snap["cities"][2], snap["cities"]
 print("ok fleet")
 
 # 1.62.0: a bug report's video: where it was filmed is blanked in place (the boxes keep their size), damage is refused.
