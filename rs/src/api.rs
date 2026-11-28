@@ -37,7 +37,7 @@ impl Hub {
             backend,
             timetable: RwLock::new(None),
             app_keys: env("HUB_APP_KEYS", "dev-key").split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
-            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan,p2p/pack,p2p/boards,p2p/key,notices,fares,admin/events,admin/me").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan,p2p/pack,p2p/boards,p2p/key,notices,fares,admin/events,admin/me,admin/notices,admin/replies,admin/audit,admin/labels,admin/releases,admin/bugs").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
             secure: env("HUB_PUBLIC_URL", "http://localhost:8080").starts_with("https://"),
             db_path: env("HUB_DB", "hub.db"),
             limiter: Mutex::new(HashMap::new()),

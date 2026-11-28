@@ -64,3 +64,33 @@ with open(f"{out}/queries.txt", "w", encoding="utf-8") as f:
 with open(f"{out}/python.jsonl", "w", encoding="utf-8") as f:
     f.writelines(json.dumps(a, ensure_ascii=False) + "\n" for a in answers)
 print(len(users), "users +", len(made), "made up;", len(q), "asked;", sum(1 for a in answers[len(everyone):] if a[1]), "allowed")
+
+# Round 2: the read-only views from the database, as an admin and as a read-only user
+def view(user, route, query):
+    h = handler(user)
+    h.admin_api("GET", route, query)
+    raw = h.wfile.getvalue()
+    head, body = raw.split(b"\r\n\r\n", 1)
+    return [int(head.split(b" ")[1]), json.loads(body)]
+
+
+with hub.db() as conn:
+    labels = [x for r in conn.execute("SELECT labels FROM bugs WHERE labels<>''") for x in r[0].split(",")]
+    words = [w for r in conn.execute("SELECT title FROM bugs ORDER BY RANDOM() LIMIT 30") for w in r[0].split()[:2]]
+asks = [("notices", {}), ("replies", {}), ("audit", {}), ("labels", {}), ("releases", {})]
+for kind in (None, "bug", "feature", "x"):
+    for status in (None, "open", "new", "resolved", "awaiting_release", "nope"):
+        asks.append(("bugs", {k: v for k, v in (("kind", kind), ("status", status)) if v}))
+asks += [("bugs", {"label": random.choice(labels)}) for _ in range(15)] + [("bugs", {"q": random.choice(words)}) for _ in range(20)]
+asks += [("bugs", {"label": " P2P ", "kind": "feature"}), ("bugs", {"q": "%"}), ("bugs", {"q": "_"})]
+q2, a2 = [], []
+admin = next(u for u in made if u["role"] == "admin")
+for user in (admin, next(u for u in made if u["role"] == "read-only")):
+    for route, query in asks:
+        q2.append((f"admin/view/{route}", urllib.parse.urlencode({"user": json.dumps(user), "query": json.dumps(query)})))
+        a2.append(view(user, route, query))
+with open(f"{out}/queries2.txt", "w", encoding="utf-8") as f:
+    f.writelines(f"{r}\t{x}\n" for r, x in q2)
+with open(f"{out}/python2.jsonl", "w", encoding="utf-8") as f:
+    f.writelines(json.dumps(a, ensure_ascii=False) + "\n" for a in a2)
+print("round 2:", len(q2), "views,", sum(len(a[1]) if isinstance(a[1], list) else 1 for a in a2), "rows/answers")

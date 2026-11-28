@@ -49,6 +49,125 @@ pub fn setting(conn: &Connection, key: &str) -> String {
     std::env::var(env).unwrap_or_else(|_| default.to_string())
 }
 
+fn cell(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Value> {
+    Ok(match r.get_ref(i)? {
+        rusqlite::types::ValueRef::Null => Value::Null,
+        rusqlite::types::ValueRef::Integer(n) => json!(n),
+        rusqlite::types::ValueRef::Real(f) => json!(f),
+        rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+        rusqlite::types::ValueRef::Blob(_) => Value::Null,
+    })
+}
+
+/// Rows as Python's [dict(r) for r in conn.execute(sql, params)].
+fn rows(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Map<String, Value>>, String> {
+    let mut st = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let names: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+    let out = st
+        .query_map(params, |r| {
+            let mut m = Map::new();
+            for (i, name) in names.iter().enumerate() {
+                m.insert(name.clone(), cell(r, i)?);
+            }
+            Ok(m)
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+const BUG_STATUSES: [&str; 6] = ["new", "triaged", "in_progress", "awaiting_release", "resolved", "closed"];
+
+fn labels_view(conn: &Connection) -> Result<Value, String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut found: HashMap<String, i64> = HashMap::new();
+    for r in rows(conn, "SELECT labels FROM bugs WHERE labels<>''", &[])? {
+        for x in r["labels"].as_str().unwrap_or("").split(',') {
+            if !found.contains_key(x) {
+                order.push(x.to_string());
+            }
+            *found.entry(x.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut pairs: Vec<(String, i64)> = order.into_iter().map(|x| { let n = found[&x]; (x, n) }).collect();
+    pairs.sort_by_key(|p| -p.1);
+    Ok(json!({"labels": pairs}))
+}
+
+fn releases_view(conn: &Connection) -> Result<Value, String> {
+    let sql = "SELECT fixed_in, COUNT(*) n, SUM(email<>'') with_email FROM bugs WHERE fixed_in<>'' GROUP BY fixed_in";
+    let counts: HashMap<String, Map<String, Value>> = rows(conn, sql, &[])?.into_iter().map(|r| (r["fixed_in"].as_str().unwrap_or("").to_string(), r)).collect();
+    let released: HashMap<String, Map<String, Value>> = rows(conn, "SELECT * FROM releases", &[])?.into_iter().map(|r| (crate::model::text_of(&r["version"]), r)).collect();
+    let all: std::collections::HashSet<&String> = counts.keys().chain(released.keys()).collect();
+    let mut versions: Vec<(Vec<i64>, String)> = Vec::new();
+    for v in all {
+        let key: Result<Vec<i64>, _> = v.split('.').map(|x| x.trim().parse::<i64>()).collect();
+        versions.push((key.map_err(|_| format!("invalid literal for int() with base 10: '{v}'"))?, v.clone()));
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    let out: Vec<Value> = versions
+        .into_iter()
+        .map(|(_, v)| {
+            let c = counts.get(&v);
+            let r = released.get(&v);
+            let get = |k: &str| r.and_then(|r| r.get(k)).cloned().unwrap_or(Value::Null);
+            let with_email = c.and_then(|c| c.get("with_email")).filter(|x| crate::model::truthy(Some(x))).cloned().unwrap_or(json!(0));
+            json!({"version": v, "fixes": c.and_then(|c| c.get("n")).cloned().unwrap_or(json!(0)), "withEmail": with_email,
+                   "released_at": get("released_at"), "notified": get("notified"), "notes_en": get("notes_en"), "notes_sk": get("notes_sk")})
+        })
+        .collect();
+    Ok(json!({"releases": out}))
+}
+
+fn bugs_view(conn: &Connection, q: &HashMap<String, String>) -> Result<Value, String> {
+    let mut sql = "SELECT id, created_at, updated_at, status, category, title, name, email, platform, kind, lang, labels, fixed_in, app_version FROM bugs".to_string();
+    let mut args: Vec<String> = vec![if q.get("kind").map(String::as_str) == Some("feature") { "feature" } else { "bug" }.to_string()];
+    let mut wh = vec!["kind=?"];
+    match q.get("status").map(String::as_str) {
+        Some(st) if BUG_STATUSES.contains(&st) => {
+            wh.push("status=?");
+            args.push(st.to_string());
+        }
+        Some("open") => wh.push("status NOT IN ('resolved','closed')"),
+        _ => {}
+    }
+    if let Some(label) = q.get("label") {
+        wh.push("(','||labels||',') LIKE ?");
+        args.push(format!("%,{},%", label.trim().chars().take(30).collect::<String>().to_lowercase()));
+    }
+    if let Some(text) = q.get("q") {
+        wh.push("(title LIKE ? OR description LIKE ? OR email LIKE ? OR name LIKE ?)");
+        for _ in 0..4 {
+            args.push(format!("%{text}%"));
+        }
+    }
+    sql += &format!(" WHERE {} ORDER BY updated_at DESC LIMIT 300", wh.join(" AND "));
+    let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a as &dyn rusqlite::ToSql).collect();
+    let list: Vec<Value> = rows(conn, &sql, &params)?
+        .into_iter()
+        .map(|mut r| {
+            let id = r["id"].as_i64().unwrap_or(0);
+            r.insert("code".into(), json!(format!("EM-{id:04}")));
+            Value::Object(r)
+        })
+        .collect();
+    Ok(Value::Array(list))
+}
+
+/// The dashboard's read-only views that come straight from the database (hub.admin_api). None: not one of them.
+pub fn view(conn: &Connection, route: &str, q: &HashMap<String, String>) -> Option<Result<Value, String>> {
+    Some(match route {
+        "notices" => rows(conn, "SELECT * FROM notices ORDER BY id DESC LIMIT 200", &[]).map(|r| json!({"notices": r, "now": now()})),
+        "replies" => rows(conn, "SELECT * FROM saved_replies ORDER BY title", &[]).map(|r| json!({"replies": r})),
+        "audit" => rows(conn, "SELECT * FROM audit_log ORDER BY id DESC LIMIT 300", &[]).map(|r| json!({"entries": r})),
+        "labels" => labels_view(conn),
+        "releases" => releases_view(conn),
+        "bugs" => bugs_view(conn, q),
+        _ => return None,
+    })
+}
+
 /// The signed-in user (a row of users, as Python's dict(row)), from the hub_session cookie.
 pub fn current_user(headers: &HeaderMap) -> Result<Option<Map<String, Value>>, String> {
     let Some(token) = cookie(headers, "hub_session") else { return Ok(None) };
@@ -317,7 +436,13 @@ pub async fn route(method: &axum::http::Method, route: &str, headers: &HeaderMap
                 return None;
             }
         }),
-        _ => None,
+        _ => match view(&conn, route, query)? {
+            Ok(v) => Some(json_response(200, serde_json::to_vec(&v).unwrap())),
+            Err(e) => {
+                eprintln!("[emhub-rs] admin/{route}: {e}");
+                None
+            }
+        },
     }
 }
 
@@ -326,6 +451,14 @@ pub fn answer(route: &str, q: &HashMap<String, String>) -> Result<(u16, Value), 
     let user: Map<String, Value> = serde_json::from_str(q.get("user").map(String::as_str).unwrap_or("{}")).map_err(|e| e.to_string())?;
     match route {
         "admin/me" => Ok((200, me(&user)?)),
+        r if r.starts_with("admin/view/") => {
+            let conn = open()?;
+            let query: HashMap<String, String> = serde_json::from_str(q.get("query").map(String::as_str).unwrap_or("{}")).map_err(|e| e.to_string())?;
+            match view(&conn, &r["admin/view/".len()..], &query) {
+                Some(v) => Ok((200, v?)),
+                None => Ok((404, json!({"error": "Not found"}))),
+            }
+        }
         "admin/allowed" => {
             let conn = open()?;
             let query: HashMap<String, String> = serde_json::from_str(q.get("query").map(String::as_str).unwrap_or("{}")).map_err(|e| e.to_string())?;
