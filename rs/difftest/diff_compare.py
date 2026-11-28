@@ -1,10 +1,10 @@
 """Python's and Rust's answers to the same queries, line by line: how many are the same, and the first differences."""
 import collections, json, sys
 
-folder = sys.argv[1]
-queries = open(f"{folder}/queries.txt", encoding="utf-8").read().splitlines()
-py = [json.loads(x) for x in open(f"{folder}/python.jsonl", encoding="utf-8")]
-rs = [json.loads(x) for x in open(f"{folder}/rust.jsonl", encoding="utf-8")]
+folder, n = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")  # n: "2" for queries2.txt, python2.jsonl, rust2.jsonl
+queries = open(f"{folder}/queries{n}.txt", encoding="utf-8").read().splitlines()
+py = [json.loads(x) for x in open(f"{folder}/python{n}.jsonl", encoding="utf-8")]
+rs = [json.loads(x) for x in open(f"{folder}/rust{n}.jsonl", encoding="utf-8")]
 assert len(py) == len(rs) == len(queries), (len(py), len(rs), len(queries))
 
 

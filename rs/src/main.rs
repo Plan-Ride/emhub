@@ -4,6 +4,7 @@
 
 mod api;
 mod community;
+mod live;
 mod model;
 mod proxy;
 mod query;
@@ -20,13 +21,32 @@ async fn main() {
     if args.len() == 4 && args[1] == "answer" {
         let _ = community::DB_PATH.set(std::env::var("HUB_DB").unwrap_or_else(|_| "hub.db".into()));
         let t = model::Timetable::load(&args[2]).expect("snapshot");
+        // HUB_TEST_LIVE: a folder with the live sources' answers (sadzv.json, fleet.json, page.txt) as Python got them
+        let gps = std::env::var("HUB_TEST_LIVE").ok().map(|dir| {
+            let read = |f: &str| std::fs::read_to_string(format!("{dir}/{f}")).ok();
+            let raw = live::Raw {
+                sadzv: read("sadzv.json").and_then(|x| serde_json::from_str(&x).ok()),
+                fleet: read("fleet.json").and_then(|x| serde_json::from_str(&x).ok()),
+                page: read("page.txt"),
+            };
+            live::merge(&raw, community::now() as f64)
+        });
+        // HUB_TEST_GPS: the buses themselves, as Python's dict (made-up ones, to compare the matching)
+        let gps = match std::env::var("HUB_TEST_GPS") {
+            Ok(file) => Some(live::gps_from_json(&serde_json::from_str(&std::fs::read_to_string(file).expect("gps file")).expect("gps json"))),
+            Err(_) => gps,
+        };
         for line in std::fs::read_to_string(&args[3]).expect("queries").lines() {
             let (route, q) = line.split_once('\t').unwrap_or((line, ""));
             // an optional third field: the moment to answer at
             let (q, at) = match q.split_once('\t') { Some((q, at)) => (q, at.parse().ok()), None => (q, None) };
             community::set_now(at);
             let query = api::parse_query(Some(q));
-            let answer = if route == "community/delay" { api::community_query(&t, &query) } else { api::timetable_query(&t, route, &query) };
+            let answer = match route {
+                "community/delay" => api::community_query(&t, &query),
+                "gps" => Ok((200, gps.as_ref().map_or(serde_json::Value::Null, live::gps_to_json))),
+                _ => api::timetable_query(&t, route, &query, gps.as_ref()),
+            };
             let out = match answer {
                 Ok((status, body)) => serde_json::json!([status, body]),
                 Err(message) => serde_json::json!([400, {"error": message}]),

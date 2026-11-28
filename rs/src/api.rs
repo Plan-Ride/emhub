@@ -37,7 +37,7 @@ impl Hub {
             backend,
             timetable: RwLock::new(None),
             app_keys: env("HUB_APP_KEYS", "dev-key").split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
-            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
             secure: env("HUB_PUBLIC_URL", "http://localhost:8080").starts_with("https://"),
             db_path: env("HUB_DB", "hub.db"),
             limiter: Mutex::new(HashMap::new()),
@@ -134,11 +134,12 @@ pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<S
     let head = request.method() == Method::HEAD;
     let hub2 = hub.clone();
     let route2 = route.clone();
+    let gps = if route == "bus" { Some(crate::live::gps().await) } else { None };
     let result = tokio::task::spawn_blocking(move || {
         if route2 == "community/delay" {
             community_query(&tt, &query).map(|(s, b)| (s, b, query))
         } else {
-            timetable_query(&tt, &route2, &query).map(|(s, b)| (s, b, query))
+            timetable_query(&tt, &route2, &query, gps.as_deref()).map(|(s, b)| (s, b, query))
         }
     })
     .await;
@@ -196,7 +197,7 @@ fn when_param(value: Option<&String>) -> Result<i64, String> {
 }
 
 /// (HTTP status, body) for GET timetable/<route> (hub.timetable_query); Err: a bad parameter (400).
-pub fn timetable_query(t: &Timetable, route: &str, q: &HashMap<String, String>) -> Result<(u16, Value), String> {
+pub fn timetable_query(t: &Timetable, route: &str, q: &HashMap<String, String>, gps: Option<&crate::live::Gps>) -> Result<(u16, Value), String> {
     let groups = Groups::parse(q.get("modes").map(String::as_str));
     let new_app = q.contains_key("modes");
     match route {
@@ -241,6 +242,15 @@ pub fn timetable_query(t: &Timetable, route: &str, q: &HashMap<String, String>) 
                 Some(trip) => Ok((200, trip)),
                 None => Ok((404, json!({"error": "No such trip"}))),
             }
+        }
+        "bus" => {
+            // 1.52.0: the apps read sadzv themselves and ask here when its bus is old, missing or (2.19.0) not checked
+            let number = |k: &str| match q.get(k) { None => Some(0), Some(v) => v.trim().parse::<i64>().ok() };
+            let (Some(line_id), Some(trip)) = (number("lineId"), number("trip")) else {
+                return Ok((400, json!({"error": "lineId and trip are numbers"})));
+            };
+            let empty = crate::live::Gps::default();
+            Ok((200, crate::live::bus_answer(t, gps.unwrap_or(&empty), line_id, trip, crate::community::now())))
         }
         "path" => {
             // EM-0064: the roads between a trip's stops, as drawn or snapped: of the stations near each position,
