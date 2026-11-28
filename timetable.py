@@ -2454,6 +2454,7 @@ def load(folder, feeds):
         except Exception as error:  # noqa: BLE001 - trains drawn straight, nothing worse
             log(f"railway shapes not read: {error}")
     current = built
+    changed()
     for step in on_loaded:
         try:
             step(built)
@@ -2512,6 +2513,92 @@ def start(folder, feeds, collect=None):
     global _collect
     _collect = collect
     threading.Thread(target=refresher, args=(Path(folder), feeds), daemon=True).start()
+    if SNAPSHOT:
+        threading.Thread(target=snapshot_writer, daemon=True).start()
+
+
+# ------------------------------------------------------------------ the snapshot for emHUB 2 (Rust)
+# 2.0.0: the Rust server answers the apps' timetable questions from the timetable built here: after each load and
+# each map edit the whole of it goes to HUB_SNAPSHOT (JSON) and the Rust server reloads it. Written by a forked copy of
+# this process, so requests here don't wait for it. Empty HUB_SNAPSHOT: none written.
+SNAPSHOT = os.environ.get("HUB_SNAPSHOT", "")
+generation, _changed_at = 0, 0.0
+
+
+def changed():
+    """The timetable or its edits changed: a new snapshot is written once things are quiet for 3 s."""
+    global generation, _changed_at
+    generation += 1
+    _changed_at = time.time()
+
+
+def snapshot(t):
+    """Everything the Rust server needs to answer as this Timetable does, as plain JSON values."""
+    services, service_index = [], {}
+    for key, days in t.services.items():
+        service_index[key] = len(services)
+        services.append(sorted(days))
+    trips = [[tr[0], tr[1], tr[2], tr[3], tr[4], tr[5], service_index.get(tr[6], -1), tr[7], tr[8], tr[9], tr[10]]
+             for tr in t.trips]
+    ends = {}
+    for key in set(edits["segments"]) | set(rail_traces):
+        points = edits["segments"].get(key)
+        if points:
+            ends[key] = [list(points[0]), list(points[-1])]
+    return {
+        "version": 1, "generation": generation, "built": t.built, "first_day": t.first_day.isoformat(),
+        "station_ids": t.station_ids, "names": t.names, "lat": t.lat, "lon": t.lon, "weight": t.weight,
+        "words": t.search_words(), "groups": [sorted(g) for g in t.station_groups()], "deleted": sorted(t.deleted),
+        "towns": [[key, town, picked] for key, (town, picked) in t.towns().items()],
+        "trips": trips, "services": services, "blocks": t.blocks,
+        "places": {str(s): v for s, v in t.places.items()}, "zones": {str(s): v for s, v in t.zones.items()},
+        "central": sorted(t.central), "children": {str(s): [[c, info] for c, info in v] for s, v in t.children.items()},
+        "parent_of": {str(s): [p, info] for s, (p, info) in t.parent_of.items()},
+        "segment_ends": ends,
+        "city": {str(i): [c[0], c[1], c[2], c[3], list(c[4])] for i, c in t.city.items()},
+        "city_platforms": {str(k): v for k, v in t.city_platforms.items()},
+    }
+
+
+def write_snapshot(t, path):
+    """In a forked copy (the data as it is at this moment, no lock held long here): JSON to path, swapped in whole."""
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot(t), f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, path)
+            code = 0
+        finally:
+            os._exit(code)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.waitstatus_to_exitcode(status) == 0
+        time.sleep(0.5)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return False
+
+
+def snapshot_writer():
+    written = None
+    while True:
+        time.sleep(2)
+        t = current
+        if t is None or written == (id(t), generation) or time.time() - _changed_at < 3:
+            continue
+        key, started = (id(t), generation), time.time()
+        try:
+            ok = write_snapshot(t, SNAPSHOT)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            ok = False
+        log(f"snapshot for the Rust server {'written' if ok else 'FAILED'} in {time.time() - started:.1f} s")
+        written = key
 
 
 def request_update():

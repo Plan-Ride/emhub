@@ -3690,7 +3690,10 @@ class Handler(BaseHTTPRequestHandler):
                                                     VALUES (?,?,?,?,?,?,?,?)""", (now(), who["username"], route_[4:], *target,
                                                                                  json.dumps(old) if old else None, json.dumps(new) if new else None))
                     self._before_send = record
-                return self.admin_api("POST", route_, query)
+                try:
+                    return self.admin_api("POST", route_, query)
+                finally:
+                    timetable.changed()  # 2.0.0: map and line edits reach the Rust server's snapshot
 
     # ---- pages & auth
 
