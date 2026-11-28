@@ -652,6 +652,7 @@ assert tc.city_bus(77, 5, at("07:05"), {(77, 5): _far}) is None
 assert tc.city_bus(77, 5, at("07:05"), {(77, 9): _near, (77, "portal"): [_near]}) == {"lat": _near[0], "lon": _near[1], "delaySeconds": 0, "source": "city"}
 assert tc.city_bus(77, 5, at("07:05"), {(77, "portal"): [_near]}) == {"lat": _near[0], "lon": _near[1], "delaySeconds": 0, "source": "city"}
 assert tc.city_bus(77, 6, at("07:05"), {(77, "portal"): [_near]}) is None and tc.city_bus(77, 5, at("07:05"), {}) is None
+assert tc.city_trip(77, 5) and not tc.city_trip(77, 6) and not tc.city_trip(78, 5)  # the app trusts emHUB only for checked trips
 # EM-0014: a city bus that catches the same regional bus further on must not replace that direct bus
 gtfs(os.path.join(folder, "c.zip"), [("X", "Zvolen, Zlatý Potok konečná", 48.58, 19.14), ("M", "Zvolen, Kozáčeka", 48.575, 19.125),
                                      ("Y", "Banská Bystrica, Tajovského školy", 48.74, 19.12)],
@@ -1673,3 +1674,31 @@ assert "q" not in json.loads(json.loads(zlib.decompress(board))["p"]), "the stop
 answer, _ = hub.p2p_board_wire("Zvolen, AS", deps[:2], {}, [], 1795600000, key, "zvolen as", answer=True)
 assert json.loads(json.loads(zlib.decompress(answer))["p"])["q"] == 1, "EM-0137: an answer (asked or cover stop) says so"
 print("ok p2p packets")
+
+# 1.68.0: callers asking at once share one fetch; a little after it expires the old value answers while one refreshes
+import sadzv as _sz  # noqa: E402
+import time as _time  # noqa: E402
+_calls = []
+def _slow():
+    _calls.append(1); _time.sleep(0.3); return len(_calls)
+_sz._cache.pop("t-flight", None)
+_got = []
+_ts = [threading.Thread(target=lambda: _got.append(_sz._cached("t-flight", 0.5, _slow, stale=5))) for _ in range(8)]
+[x.start() for x in _ts]; [x.join() for x in _ts]
+assert _got == [1] * 8 and len(_calls) == 1, (_got, _calls)
+_time.sleep(0.6)
+assert _sz._cached("t-flight", 0.5, _slow, stale=5) == 1, "expired: the old value at once"
+_time.sleep(0.5)
+assert len(_calls) == 2 and _sz._cached("t-flight", 0.5, _slow, stale=5) == 2, "...and the new one after the refresh"
+# the same plan asked at once is searched once; "pre" is the same search
+_n = []
+_real = hub.timetable_query
+hub.timetable_query = lambda route, query: (_n.append(1), _time.sleep(0.2), (200, {"connections": [len(_n)]}))[2]
+_out = []
+_ts = [threading.Thread(target=lambda i=i: _out.append(hub.plan_answer("plan", {"from": "a", "to": "b", "time": "1", **({"pre": "1"} if i % 2 else {})})))
+       for i in range(6)]
+[x.start() for x in _ts]; [x.join() for x in _ts]
+assert len(_n) == 1 and all(o == (200, {"connections": [1]}) for o in _out), (_n, _out)
+assert hub.plan_answer("plan", {"from": "a", "to": "c", "time": "1"})[1] == {"connections": [2]}
+hub.timetable_query = _real
+print("ok shared fetches")

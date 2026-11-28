@@ -31,18 +31,48 @@ def _call(path, body=None):
         return json.load(response)
 
 
-def _cached(key, ttl, fetch):
-    now = time.time()
-    with _lock:
-        hit = _cache.get(key)
-        if hit and hit[0] > now:
+_fetching = {}          # key -> Event of the fetch under way (1.68.0: one fetch per key, the others wait for it)
+
+
+def _cached(key, ttl, fetch, stale=0):
+    """
+    fetch()'s value, kept ttl s. Callers asking at once share one fetch. stale: for that many s after it expires the
+    old value is still answered while one fetch runs in the background (1.68.0: no request waits for the bus sources).
+    """
+    while True:
+        now = time.time()
+        with _lock:
+            hit = _cache.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
+            running = _fetching.get(key)
+            if running is None:
+                running = _fetching[key] = threading.Event()
+                mine = True
+            else:
+                mine = False
+        if mine:
+            if hit and now - hit[0] < stale:
+                threading.Thread(target=_refresh, args=(key, ttl, fetch, running), daemon=True).start()
+                return hit[1]
+            return _refresh(key, ttl, fetch, running)
+        if hit and now - hit[0] < stale:
             return hit[1]
-    value = fetch()
-    with _lock:
-        if len(_cache) > 5000:
-            _cache.clear()  # ponytail: crude bound, fine for one city's worth of trips
-        _cache[key] = (now + ttl, value)
-    return value
+        running.wait(30)  # then the cache has it, or the fetch failed and this caller tries itself
+
+
+def _refresh(key, ttl, fetch, running):
+    try:
+        value = fetch()
+        with _lock:
+            if len(_cache) > 5000:
+                _cache.clear()  # ponytail: crude bound, fine for one city's worth of trips
+            _cache[key] = (time.time() + ttl, value)
+        return value
+    finally:
+        with _lock:
+            _fetching.pop(key, None)
+        running.set()
 
 
 def platforms():
@@ -358,7 +388,7 @@ def vehicles():
             if out[key][4]:
                 out.setdefault((key[0], "portal"), []).append(out[key])
         return out
-    return _cached("vehicles", 20, fetch)
+    return _cached("vehicles", 20, fetch, stale=60)
 
 
 def _departures(ids):

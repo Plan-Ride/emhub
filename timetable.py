@@ -14,6 +14,7 @@ import array
 import bisect
 import collections
 import ctypes
+import functools
 import csv
 import hashlib
 import io
@@ -196,6 +197,24 @@ def prefix_match(token, words, i):
         if rest:
             return 1 + rest
     return 0
+
+
+def word_index(names):
+    """
+    {key: [n]} of names (lists of words) a typed word can start in: its first letter, and its first two letters, which
+    prefix_match finds in one word (w[:2], also an abbreviation of 3+ letters) or as the starts of two in a row.
+    """
+    index = {}
+    for n, words in enumerate(names):
+        keys = {w[0] for w in words if w} | {w[:2] for w in words if len(w) >= 2} | {a[0] + b[0] for a, b in zip(words, words[1:]) if a and b}
+        for key in keys:
+            index.setdefault(key, []).append(n)
+    return index
+
+
+def candidates(index, token):
+    """The names that the first typed word can match (match_score needs it to start a word)."""
+    return index.get(token[:2], ())
 
 
 def match_score(tokens, words):
@@ -1282,6 +1301,10 @@ class Timetable:
                     plates.add(b[4])
         return keys, plates
 
+    def city_trip(self, line_id, trip_number):
+        """Whether (line id, trip number) is a city trip of the day trusted() last looked at (city_bus calls it first)."""
+        return (line_id, trip_number) in self._city_day[1]
+
     def city_line_ids(self):
         """{line number: {sadzv line ids}} of the city buses (a number can be Zvolen's and Banska Bystrica's)."""
         if not getattr(self, "_line_ids", None):
@@ -1569,6 +1592,7 @@ class Timetable:
                 if self.rail_only(s):
                     words[s] = words[s] + ["vlak"]   # "zvolen vlak" finds the train station
             self._search_words = words
+            self._search_index = word_index(words)
         return self._search_words
 
     def search(self, text, limit=18, groups=OLD_APPS, towns=False):
@@ -1578,12 +1602,20 @@ class Timetable:
             return []
         found = []
         if towns:
-            for key, (town, _) in self.towns().items():
+            index = self.__dict__.get("_town_search")
+            if index is None or index[0] is not self.towns():
+                keys = list(self.towns())
+                index = self._town_search = (self.towns(), keys, word_index([k.split() for k in keys]))
+            for n in candidates(index[2], tokens[0]):
+                key = index[1][n]
+                town = self.towns()[key][0]
                 score = match_score(tokens, key.split())
                 if score is not None and len(tokens) <= len(key.split()):
                     found.append((-score - 100, 0, town, ("town", key)))
-        for s, words in enumerate(self.search_words()):
-            if not words or s in self.deleted or tokens[0][0] not in {w[0] for w in words}:
+        words_of = self.search_words()
+        for s in candidates(self._search_index, tokens[0]):  # 1.68.0: was every station with the letter, 80 ms a search
+            words = words_of[s]
+            if s in self.deleted:
                 continue
             if "rail" not in groups and self.rail_only(s):
                 continue
@@ -2205,12 +2237,13 @@ def along(points, f):
     return points[-1]
 
 
+@functools.lru_cache(maxsize=20000)
 def name_keys(name):
     """
     A stop's name as a direction can say it: the whole name, or just its town. "Zvolen, Západ" -> {"zvolen zapad",
     "zvolen"}, so "towards Krupina" fits every Krupina stop while "towards Zvolen, Západ" fits only that one.
     """
-    return {" ".join(fold(str(name))), " ".join(fold(str(name).split(",")[0]))}
+    return frozenset((" ".join(fold(str(name))), " ".join(fold(str(name).split(",")[0]))))
 
 
 def directions_of(spot):
@@ -2409,6 +2442,7 @@ def load(folder, feeds):
     # 1.57.0: today without trains (apps before 2.18.0), towns and the search words ready too, and the planner's arrays.
     built.towns()
     built.search_words()
+    built._busy = collections.Counter(s for trip in built.trips for s in trip[7])  # 1.68.0: the first plan took 0.8 s for it
     for day in (built.day(today), built.day(today, OLD_APPS)):
         if NATIVE is not None:
             _native_net(built, day)

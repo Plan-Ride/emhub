@@ -14,6 +14,7 @@ One stdlib-only process:
 Configuration comes from environment variables (see hub.env.example).
 """
 from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 import base64
 import binascii
 import hashlib
@@ -59,7 +60,11 @@ import fleet
 import sadzv
 import timetable
 
-VERSION = "1.67.1"
+# 1.68.0: one TLS context for every outgoing request. urllib made a new one each time (71 ms of CPU loading the CA list),
+# so each fetch of sadzv, qrbus, the city page or the weather cost ~90 ms of CPU.
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl.create_default_context())))
+
+VERSION = "1.68.0"
 HERE = Path(__file__).resolve().parent
 ENV = os.environ.get
 
@@ -2974,12 +2979,13 @@ def history_reports(conn, trip_key):
     trip, day = run
     kind = day_type(day)
     parts = trip_key.split("|")
-    prefix = "|".join(parts[:3] if parts[0] == "sadzv" else parts[:-1]) + "|%"
+    prefix = "|".join(parts[:3] if parts[0] == "sadzv" else parts[:-1]) + "|"
     runs = {}
+    # 1.68.0: a range on the trip_key index; LIKE scanned every report of the last HISTORY_DAYS (20 ms of each plan)
     for key, delay_s, report_kind, stop_index in conn.execute(
-        """SELECT trip_key, delay_s, kind, stop_index FROM community_reports WHERE trip_key LIKE ? AND created_at>=?
+        """SELECT trip_key, delay_s, kind, stop_index FROM community_reports WHERE trip_key >= ? AND trip_key < ? AND created_at>=?
            AND reporter NOT IN (SELECT reporter FROM blocked_reporters)""",
-        (prefix, now() - HISTORY_DAYS * 86400),
+        (prefix, prefix[:-1] + "}", now() - HISTORY_DAYS * 86400),
     ):
         other = trip_run(key)
         if other and other[0] == trip and other[1] != day and day_type(other[1]) == kind:
@@ -3394,7 +3400,10 @@ def timetable_query(route, query):
             line_id, number = int(query.get("lineId") or 0), int(query.get("trip") or 0)
         except ValueError:
             return 400, {"error": "lineId and trip are numbers"}
-        return 200, {"bus": t.city_bus(line_id, number, int(time.time()), sadzv.vehicles()) if line_id else None, "at": now()}
+        bus = t.city_bus(line_id, number, int(time.time()), sadzv.vehicles()) if line_id else None
+        # 1.68.0: "checked": a city trip of today, whose number emHUB checked against the bus's start and place. The app
+        # then takes this answer over sadzv's bus under that number (null = that bus runs another trip or none is known).
+        return 200, {"bus": bus, "checked": bool(line_id) and t.city_trip(line_id, number), "at": now()}
     if route == "trip":
         trip = t.trip(query.get("id") or "") if re.fullmatch(r"[^:]+:.+:\d{8}", query.get("id") or "") else None
         return (200, trip) if trip else (404, {"error": "No such trip"})
@@ -3442,6 +3451,37 @@ def timetable_query(route, query):
         end = lambda value, s: t.town_json(value[5:].replace("-", " ")) if str(value).startswith("town:") else t.station_json(s)  # noqa: E731
         return 200, {"from": end(query.get("from") or "", origin), "to": end(query.get("to") or "", target), "connections": journeys}
     return 404, {"error": "Not found"}
+
+
+PLAN_CACHE_S = 15
+_plans, _plans_lock = {}, threading.Lock()  # query -> (until, Future of (status, body))
+
+
+def plan_answer(route, query):
+    """
+    timetable_query for plan, an answer kept 15 s (1.68.0): the same search asked again (the app's search ahead, pre=1,
+    then the rider's own; phones at one stop) is searched once, and those asking at once wait for that one search.
+    Without a time, "now" counts in 15 s steps. Nothing may change the answer it returns: others get the same one.
+    """
+    key = tuple(sorted((k, v) for k, v in query.items() if k != "pre"))
+    if "time" not in query:
+        key += (("now", int(time.time()) // PLAN_CACHE_S),)
+    with _plans_lock:
+        hit = _plans.get(key)
+        mine = not hit or hit[0] < time.time()
+        if mine:
+            if len(_plans) > 500:
+                for k in [k for k, v in _plans.items() if v[0] < time.time()]:
+                    del _plans[k]
+            hit = _plans[key] = (time.time() + PLAN_CACHE_S, concurrent.futures.Future())
+    if mine:
+        try:
+            hit[1].set_result(timetable_query(route, query))
+        except BaseException as error:  # noqa: BLE001
+            hit[1].set_exception(error)
+            with _plans_lock:
+                _plans.pop(key, None)
+    return hit[1].result(timeout=120)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3877,7 +3917,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and route.startswith("timetable/"):
             if not timetable_limiter.allow(self.client_ip()):
                 return self.error(429, "Too many requests", cors=True)
-            status, body = timetable_query(route[len("timetable/"):], query)
+            status, body = (plan_answer if route == "timetable/plan" else timetable_query)(route[len("timetable/"):], query)
             count_search(route[len("timetable/"):], query, status, body)
             return self.send(status, body, headers=self.cors())
         if method == "GET" and route == "p2p/pack":
@@ -5680,6 +5720,9 @@ def server_health():
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    # 1.68.0: socketserver queues only 5 connections not yet accepted; at 100 requests at once the kernel dropped the
+    # rest (266 since boot) and their clients retried after 1, 3, 7, 15 s (a 21 s request in the load test).
+    request_queue_size = 128
 
     def handle_error(self, request, client_address):
         # Clients closing idle connections is normal; log only real errors.
