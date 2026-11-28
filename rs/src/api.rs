@@ -37,7 +37,7 @@ impl Hub {
             backend,
             timetable: RwLock::new(None),
             app_keys: env("HUB_APP_KEYS", "dev-key").split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect(),
-            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan,p2p/pack,p2p/boards,p2p/key,notices,fares").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
+            routes: env("HUB_RS_ROUTES", "stops,departures,trip,path,community/delay,bus,plan,p2p/pack,p2p/boards,p2p/key,notices,fares,admin/events,admin/me").split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
             secure: env("HUB_PUBLIC_URL", "http://localhost:8080").starts_with("https://"),
             db_path: env("HUB_DB", "hub.db"),
             limiter: Mutex::new(HashMap::new()),
@@ -114,7 +114,20 @@ fn error(hub: &Hub, status: u16, message: &str) -> Response {
 
 /// Every request: a Rust route when it is one and the timetable is loaded, else Python.
 pub async fn entry(State(hub): State<Arc<Hub>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, request: Request) -> Response {
-    let path = request.uri().path();
+    let path = request.uri().path().to_string();
+    if path == "/internal/publish" && request.method() == Method::POST {
+        let headers = request.headers().clone();
+        let body = axum::body::to_bytes(request.into_body(), 1024).await.unwrap_or_default();
+        return crate::admin::internal_publish(peer, &headers, &body);
+    }
+    if let Some(route) = path.strip_prefix("/admin/api/") {
+        let query = parse_query(request.uri().query());
+        if let Some(response) = crate::admin::route(request.method(), route, request.headers(), &query, &hub.routes).await {
+            return response;
+        }
+        return proxy::forward(&hub.backend, peer, request).await;
+    }
+    let path = path.as_str();
     // "stops" for /api/v1/timetable/stops, "community/delay" for /api/v1/community/delay
     let route = path.strip_prefix("/api/v1/timetable/").or_else(|| path.strip_prefix("/api/v1/")).map(str::to_string);
     let tt = hub.timetable.read().unwrap().clone();

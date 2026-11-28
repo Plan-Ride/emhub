@@ -2,6 +2,7 @@
 //! routes moved to Rust (HUB_RS_ROUTES) from the timetable Python builds (HUB_SNAPSHOT), and hands every other request
 //! to the Python emHUB (HUB_BACKEND, 127.0.0.1:8081), WebSockets and event streams included.
 
+mod admin;
 mod api;
 mod community;
 mod fares;
@@ -49,6 +50,7 @@ async fn main() {
             let query = api::parse_query(Some(q));
             let answer = match route {
                 "community/delay" => api::community_query(&t, &query),
+                "admin/me" | "admin/allowed" => admin::answer(route, &query),
                 "p2p/pack" | "p2p/boards" | "p2p/key" | "notices" | "fares" => api::public_query(&t, route, &query, gps.as_ref()),
                 "plan" => planapi::plan_query(t.clone(), query).await,
                 "sadzv" => {

@@ -2935,6 +2935,12 @@ _listeners_lock = threading.Lock()
 MAX_LISTENERS = 20  # open dashboards; each holds a thread
 
 
+# 2.0.0: open dashboards hold their event stream at the Rust server (in front); it hears of changes made here through
+# POST /internal/publish (loopback only, with this key).
+INTERNAL_KEY = ENV("HUB_INTERNAL_KEY", "")
+RS_URL = ENV("HUB_RS_URL", "http://127.0.0.1:8080")
+
+
 def publish(kind):
     """Tell open dashboards that "bugs" or "community" changed; they reload that view."""
     with _listeners_lock:
@@ -2943,6 +2949,16 @@ def publish(kind):
                 q.put_nowait(kind)
             except queue.Full:
                 pass
+    if INTERNAL_KEY:
+        threading.Thread(target=_tell_rust, args=(kind,), daemon=True).start()
+
+
+def _tell_rust(kind):
+    try:
+        urllib.request.urlopen(urllib.request.Request(RS_URL + "/internal/publish", kind.encode(), {
+            "X-Internal-Key": INTERNAL_KEY, "Content-Type": "text/plain"}), timeout=5).close()
+    except Exception as error:  # noqa: BLE001 - the Rust server restarting: the dashboards reload on their next event
+        print(f"[emhub] publish {kind}: {error}", flush=True)
 
 
 def local_day_range(day):
